@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -46,7 +47,8 @@ struct ps_session {
     char *tmp_path;
     int64_t opened_at;
     int64_t base_seq;
-    int dirty;
+    int dirty;   /* modified (write or truncate) */
+    int written; /* at least one write() (truncate alone does not count) */
     struct rangelist ranges; /* byte ranges touched by this edit */
     ps_session *next;
 };
@@ -156,6 +158,13 @@ static int blob_path(ps_store *ps, const char *id, char *out, size_t out_sz) {
 
 static int ranges_path(ps_store *ps, const char *id, char *out, size_t out_sz) {
     snprintf(out, out_sz, "%s/ranges/%s", ps->store_dir, id);
+    return 0;
+}
+
+static int origin_path(ps_store *ps, const char *relpath, char *out, size_t out_sz) {
+    char enc[4096];
+    encode_path(relpath, enc, sizeof enc);
+    snprintf(out, out_sz, "%s/origin/%s", ps->store_dir, enc);
     return 0;
 }
 
@@ -347,21 +356,27 @@ static int meta_load(ps_store *ps, const char *relpath, struct patchrec **out) {
     return n;
 }
 
-static int merge_meta_read(ps_store *ps, const char *relpath, int64_t *seq, off_t *size) {
+static int merge_meta_read(ps_store *ps, const char *relpath, int64_t *seq, off_t *size,
+                           int64_t *opened_at) {
     char mp[4096];
     merge_meta_path(ps, relpath, mp, sizeof mp);
     FILE *f = fopen(mp, "r");
     if (!f) return 0;
-    long long s, sz;
-    char owner[64];
-    int got = 0;
-    if (fscanf(f, "M %lld %lld %63s", &s, &sz, owner) == 3) {
-        *seq = s;
-        *size = (off_t)sz;
-        got = 1;
+    char line[256];
+    if (!fgets(line, sizeof line, f)) {
+        fclose(f);
+        return 0;
     }
     fclose(f);
-    return got;
+    long long s, sz, oa = 0;
+    char owner[64] = "";
+    if (sscanf(line, "M %lld %lld %63s %lld", &s, &sz, owner, &oa) >= 3) {
+        *seq = s;
+        *size = (off_t)sz;
+        if (opened_at) *opened_at = oa;
+        return 1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -375,7 +390,7 @@ ps_store *ps_open(const char *store_dir, const char *lower_dir) {
     ps->lower_dir = strdup(lower_dir);
     pthread_mutex_init(&ps->lock, NULL);
 
-    const char *subs[] = { "blobs", "meta", "merge", "mounts", "messages", "ranges", "tmp" };
+    const char *subs[] = { "blobs", "meta", "merge", "mounts", "messages", "origin", "ranges", "tmp" };
     if (ensure_dir(ps->store_dir) != 0) goto fail;
     for (size_t i = 0; i < sizeof subs / sizeof subs[0]; i++) {
         char sub[4096];
@@ -438,6 +453,23 @@ static int copy_path_into(const char *src, int dst_fd) {
     return 0;
 }
 
+/* snapshot the lower (origin) content as the base for `relpath` (once) */
+static void snapshot_origin(ps_store *ps, const char *relpath) {
+    char op[4096];
+    origin_path(ps, relpath, op, sizeof op);
+    if (access(op, F_OK) == 0) return; /* already captured */
+
+    char lp[4096];
+    lower_path(ps, relpath, lp, sizeof lp);
+    struct stat st;
+    if (stat(lp, &st) != 0 || !S_ISREG(st.st_mode)) return;
+
+    int fd = open(op, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    copy_path_into(lp, fd);
+    close(fd);
+}
+
 static int seed_session(ps_store *ps, ps_session *s, int exists) {
     s->base_seq = 0;
     if (!exists) return 0;
@@ -452,6 +484,7 @@ static int seed_session(ps_store *ps, ps_session *s, int exists) {
         struct stat st;
         if (stat(lp, &st) == 0 && S_ISREG(st.st_mode)) path = lp;
         else return 0;
+        snapshot_origin(ps, s->relpath); /* record the origin base we are editing */
     } else {
         path = blob;
     }
@@ -470,7 +503,7 @@ static ps_session *begin_common(ps_store *ps, const char *relpath, int exists, i
 
     char tmp[4096];
     snprintf(tmp, sizeof tmp, "%s/tmp/%lld-%ld.tmp", ps->store_dir,
-             (long long)s->opened_at, ps->seq++);
+             (long long)s->opened_at, __atomic_add_fetch(&ps->seq, 1, __ATOMIC_RELAXED));
     s->tmp_path = strdup(tmp);
 
     s->fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -515,6 +548,7 @@ ssize_t ps_write(ps_store *ps, ps_session *s, const char *buf, size_t size, off_
     ssize_t w = pwrite(s->fd, buf, size, off);
     if (w < 0) return -errno;
     s->dirty = 1;
+    s->written = 1;
     rl_add(&s->ranges, off, off + (off_t)w);
     return w;
 }
@@ -525,6 +559,10 @@ int ps_session_fd(ps_session *s) {
 
 int ps_session_dirty(ps_session *s) {
     return s->dirty;
+}
+
+int ps_session_written(ps_session *s) {
+    return s->written;
 }
 
 int ps_session_is_merge(ps_session *s) {
@@ -578,7 +616,7 @@ static int compute_conflict(ps_store *ps, ps_session *s, struct rangelist *out) 
     /* an unseen merge covers the whole file: any write to it conflicts */
     int64_t mseq;
     off_t msize;
-    if (merge_meta_read(ps, s->relpath, &mseq, &msize) && mseq > s->base_seq) {
+    if (merge_meta_read(ps, s->relpath, &mseq, &msize, NULL) && mseq > s->base_seq) {
         for (int a = 0; a < s->ranges.n; a++)
             rl_add(out, s->ranges.r[a].lo, s->ranges.r[a].hi);
     }
@@ -598,18 +636,53 @@ int ps_check_conflict(ps_store *ps, ps_session *s) {
 /* conflict messages (stderr + /fuse/messages/, de-duplicated)         */
 /* ------------------------------------------------------------------ */
 
-static void run_diff(const char *a, const char *b, const char *label_a,
-                     const char *label_b, FILE *out) {
-    char cmd[16384];
-    snprintf(cmd, sizeof cmd,
-             "diff -u --label '%s' --label '%s' '%s' '%s' 2>/dev/null",
-             label_a, label_b, a, b);
-    FILE *p = popen(cmd, "r");
-    if (!p) return;
+/* run an external program with explicit argv (no shell -> no injection);
+ * optionally redirect stdin/stdout from files. Returns exit status or -1. */
+static int run_prog(char *const argv[], const char *stdin_path, const char *stdout_path) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (stdin_path) {
+            int fd = open(stdin_path, O_RDONLY);
+            if (fd >= 0) {
+                dup2(fd, 0);
+                close(fd);
+            }
+        }
+        if (stdout_path) {
+            int fd = open(stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                dup2(fd, 1);
+                close(fd);
+            }
+        }
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) {
+            dup2(dn, 2);
+            close(dn);
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    return -1;
+}
+
+static void run_diff(ps_store *ps, const char *a, const char *b,
+                     const char *label_a, const char *label_b, FILE *out) {
+    char tmpout[4096];
+    snprintf(tmpout, sizeof tmpout, "%s/tmp/diff.out", ps->store_dir);
+    char *argv[] = { "diff", "-u", "--label", (char *)label_a, "--label",
+                     (char *)label_b, (char *)a, (char *)b, NULL };
+    int rc = run_prog(argv, NULL, tmpout);
+    FILE *in = fopen(tmpout, "r");
+    if (!in) return;
     char line[4096];
-    while (fgets(line, sizeof line, p))
+    while (fgets(line, sizeof line, in))
         fputs(line, out);
-    int rc = pclose(p);
+    fclose(in);
     if (rc == 0)
         fprintf(out, "(no differences)\n");
 }
@@ -638,7 +711,7 @@ static int base_content_path(ps_store *ps, const char *relpath, int64_t base_seq
     patchrec_free(recs, n);
     int64_t mseq;
     off_t msize;
-    if (merge_meta_read(ps, relpath, &mseq, &msize) && mseq == base_seq) {
+    if (merge_meta_read(ps, relpath, &mseq, &msize, NULL) && mseq == base_seq) {
         merge_blob_path(ps, relpath, out, out_sz);
         return 1;
     }
@@ -712,8 +785,8 @@ static void write_message(ps_store *ps, ps_session *s, int64_t seq) {
 
     fprintf(out, hdr, s->relpath);
     fprintf(stderr, hdr, s->relpath);
-    run_diff(base, cur, "your base", "other writers", out);
-    run_diff(base, cur, "your base", "other writers", stderr);
+    run_diff(ps, base, cur, "your base", "other writers", out);
+    run_diff(ps, base, cur, "your base", "other writers", stderr);
     fprintf(out, ftr, s->relpath + 1);
     fprintf(stderr, ftr, s->relpath + 1);
 
@@ -774,9 +847,10 @@ static void mark_pending_accepted(ps_store *ps, const char *relpath) {
     struct patchrec *recs = NULL;
     int n = meta_load(ps, relpath, &recs);
     if (n == 0) return;
-    char mp[4096];
+    char mp[4096], tmp[4192];
     meta_path(ps, relpath, mp, sizeof mp);
-    FILE *f = fopen(mp, "w");
+    snprintf(tmp, sizeof tmp, "%s.tmp", mp);
+    FILE *f = fopen(tmp, "w");
     if (!f) {
         patchrec_free(recs, n);
         return;
@@ -789,6 +863,7 @@ static void mark_pending_accepted(ps_store *ps, const char *relpath) {
                 (long long)r->size, r->owner, (long long)r->seq, state);
     }
     fclose(f);
+    rename(tmp, mp); /* atomic: concurrent readers never see a torn index */
     patchrec_free(recs, n);
 }
 
@@ -815,7 +890,8 @@ static int commit_merge(ps_store *ps, ps_session *s) {
     merge_meta_path(ps, s->relpath, mm, sizeof mm);
     FILE *f = fopen(mm, "w");
     if (f) {
-        fprintf(f, "M %lld %lld %s\n", (long long)seq, (long long)st.st_size, ps->owner);
+        fprintf(f, "M %lld %lld %s %lld\n", (long long)seq, (long long)st.st_size,
+                ps->owner, (long long)s->opened_at);
         fclose(f);
     }
 
@@ -956,24 +1032,30 @@ ps_src ps_resolve(ps_store *ps, const char *relpath, char *blob_out, size_t blob
     if (seq_out) *seq_out = 0;
 
     int64_t best_seq = 0;
+    int64_t best_opened = -1;
     int best_kind = PS_SRC_LOWER;
     char best_blob[4096] = "";
 
-    int64_t mseq;
+    int64_t mseq, mopened = 0;
     off_t msize;
-    if (merge_meta_read(ps, relpath, &mseq, &msize)) {
+    if (merge_meta_read(ps, relpath, &mseq, &msize, &mopened)) {
         merge_blob_path(ps, relpath, best_blob, sizeof best_blob);
         best_seq = mseq;
+        best_opened = mopened;
         best_kind = PS_SRC_MERGE;
     }
 
+    /* order by open time: async commits can land out of order, so the
+     * latest-written (latest-opened) patch is the current content */
     struct patchrec *recs = NULL;
     int n = meta_load(ps, relpath, &recs);
     for (int i = 0; i < n; i++) {
         if (recs[i].state != 'A') continue;
-        if (recs[i].seq > best_seq) {
+        if (recs[i].opened_at > best_opened ||
+            (recs[i].opened_at == best_opened && recs[i].seq > best_seq)) {
             blob_path(ps, recs[i].id, best_blob, sizeof best_blob);
             best_seq = recs[i].seq;
+            best_opened = recs[i].opened_at;
             best_kind = PS_SRC_PATCH;
         }
     }
@@ -989,7 +1071,7 @@ ps_src ps_resolve(ps_store *ps, const char *relpath, char *blob_out, size_t blob
 int ps_merge_resolve(ps_store *ps, const char *relpath, char *blob_out, size_t blob_out_sz) {
     int64_t mseq;
     off_t msize;
-    if (!merge_meta_read(ps, relpath, &mseq, &msize)) return 0;
+    if (!merge_meta_read(ps, relpath, &mseq, &msize, NULL)) return 0;
     merge_blob_path(ps, relpath, blob_out, blob_out_sz);
     return 1;
 }
@@ -1161,6 +1243,141 @@ static int copy_file_to_path(const char *src, const char *dst) {
     return rc;
 }
 
+static void collect_path(char ***arr, int *n, int *cap, const char *rel);
+
+static int paths_equal(const char *a, const char *b) {
+    int fa = open(a, O_RDONLY);
+    if (fa < 0) return -1;
+    int fb = open(b, O_RDONLY);
+    if (fb < 0) {
+        close(fa);
+        return -1;
+    }
+    char ba[65536], bb[65536];
+    int eq = 1;
+    for (;;) {
+        ssize_t na = read(fa, ba, sizeof ba);
+        ssize_t nb = read(fb, bb, sizeof bb);
+        if (na != nb) {
+            eq = 0;
+            break;
+        }
+        if (na == 0) break;
+        if (memcmp(ba, bb, (size_t)na) != 0) {
+            eq = 0;
+            break;
+        }
+    }
+    close(fa);
+    close(fb);
+    return eq;
+}
+
+int ps_origin_changed(ps_store *ps, const char *relpath) {
+    char op[4096];
+    origin_path(ps, relpath, op, sizeof op);
+    if (access(op, F_OK) != 0) return 0; /* never snapshotted */
+
+    char lp[4096];
+    lower_path(ps, relpath, lp, sizeof lp);
+    struct stat st;
+    if (stat(lp, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+
+    int eq = paths_equal(op, lp);
+    return eq == 1 ? 0 : 1;
+}
+
+/* emit a 3-way diff-conflict (base=snapshot, theirs=lower, ours=resolved) */
+static int emit_origin_conflict(ps_store *ps, const char *relpath) {
+    char op[4096], lp[4096], blob[4096];
+    origin_path(ps, relpath, op, sizeof op);
+    lower_path(ps, relpath, lp, sizeof lp);
+    int64_t seq;
+    ps_src src = ps_resolve(ps, relpath, blob, sizeof blob, &seq);
+    const char *ours = (src == PS_SRC_LOWER) ? lp : blob;
+
+    char outp[4096];
+    snprintf(outp, sizeof outp, "%s/tmp/diff3.out", ps->store_dir);
+    char *argv[] = { "diff3", "-m", "--label=base", "--label=theirs", "--label=ours",
+                     op, lp, (char *)ours, NULL };
+    int rc = run_prog(argv, NULL, outp);
+
+    char mdir[4096];
+    snprintf(mdir, sizeof mdir, "%s/messages/%s", ps->store_dir, ps->owner);
+    ensure_dir(mdir);
+    int64_t seq2 = next_seq(ps);
+    char msg[4096], tmp[4192];
+    snprintf(msg, sizeof msg, "%s/%lld.msg", mdir, (long long)seq2);
+    snprintf(tmp, sizeof tmp, "%s.tmp", msg);
+
+    FILE *out = fopen(tmp, "w");
+    if (!out) return -1;
+    const char *hdr = "ORIGIN CONFLICT on %s: the lower fs changed behind our stack:\n\n";
+    fprintf(out, hdr, relpath);
+    fprintf(stderr, hdr, relpath);
+    FILE *in = fopen(outp, "r");
+    if (in) {
+        char line[4096];
+        while (fgets(line, sizeof line, in)) {
+            fputs(line, out);
+            fputs(line, stderr);
+        }
+        fclose(in);
+    }
+    const char *ftr = "\n(resolved above; conflict markers present if hunks overlap)\n";
+    fprintf(out, "%s", ftr);
+    fprintf(stderr, "%s", ftr);
+    fclose(out);
+    rename(tmp, msg);
+    return rc == 1 ? 1 : 0;
+}
+
+int ps_report_origin_conflicts(ps_store *ps) {
+    char **paths = NULL;
+    int n = 0, cap = 0;
+
+    char mdir[4096];
+    snprintf(mdir, sizeof mdir, "%s/meta", ps->store_dir);
+    DIR *d = opendir(mdir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            char rel[4096];
+            decode_path(e->d_name, rel, sizeof rel);
+            collect_path(&paths, &n, &cap, rel);
+        }
+        closedir(d);
+    }
+    char mg[4096];
+    snprintf(mg, sizeof mg, "%s/merge", ps->store_dir);
+    d = opendir(mg);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            size_t len = strlen(e->d_name);
+            if (len < 5 || strcmp(e->d_name + len - 5, ".meta") != 0) continue;
+            char base[4096];
+            snprintf(base, sizeof base, "%.*s", (int)(len - 5), e->d_name);
+            char rel[4096];
+            decode_path(base, rel, sizeof rel);
+            collect_path(&paths, &n, &cap, rel);
+        }
+        closedir(d);
+    }
+
+    int conflicts = 0;
+    for (int i = 0; i < n; i++) {
+        if (ps_origin_changed(ps, paths[i])) {
+            if (emit_origin_conflict(ps, paths[i]) == 1) conflicts++;
+        }
+        free(paths[i]);
+    }
+    free(paths);
+    return conflicts;
+}
+
 static void collect_path(char ***arr, int *n, int *cap, const char *rel) {
     for (int i = 0; i < *n; i++)
         if (strcmp((*arr)[i], rel) == 0) return;
@@ -1214,6 +1431,12 @@ int ps_apply_to_origin(ps_store *ps) {
         int64_t seq;
         ps_src src = ps_resolve(ps, paths[i], blob, sizeof blob, &seq);
         if (src == PS_SRC_LOWER) continue; /* rejected or untouched */
+
+        /* the origin changed behind our stack: report, don't clobber */
+        if (ps_origin_changed(ps, paths[i])) {
+            emit_origin_conflict(ps, paths[i]);
+            continue;
+        }
         char lp[4096];
         lower_path(ps, paths[i], lp, sizeof lp);
         if (copy_file_to_path(blob, lp) == 0) applied++;
@@ -1272,7 +1495,8 @@ static int merge_put_fd(ps_store *ps, const char *relpath, int content_fd, off_t
     merge_meta_path(ps, relpath, mm, sizeof mm);
     FILE *f = fopen(mm, "w");
     if (f) {
-        fprintf(f, "M %lld %lld %s\n", (long long)seq, (long long)size, ps->owner);
+        fprintf(f, "M %lld %lld %s %lld\n", (long long)seq, (long long)size,
+                ps->owner, (long long)now_ns());
         fclose(f);
     }
     owner_write_seq(ps, ps->owner, seq);
@@ -1375,8 +1599,8 @@ static void print_diff_conflict(ps_store *ps, const char *relpath,
     const char *hdr = "CONFLICT applying patch to %s (real final diff-conflict):\n\n";
     fprintf(out, hdr, relpath);
     fprintf(stderr, hdr, relpath);
-    run_diff(theirs, proposed, "theirs", "proposed (with conflicts)", out);
-    run_diff(theirs, proposed, "theirs", "proposed (with conflicts)", stderr);
+    run_diff(ps, theirs, proposed, "theirs", "proposed (with conflicts)", out);
+    run_diff(ps, theirs, proposed, "theirs", "proposed (with conflicts)", stderr);
     fclose(out);
     rename(tmp, msg);
 }
@@ -1403,12 +1627,11 @@ static int apply_file_diff(ps_store *ps, const char *relpath, const char *seg) {
     fputs(seg, df);
     fclose(df);
 
-    char cmd[16384];
-    snprintf(cmd, sizeof cmd, "patch --merge -s -p1 '%s' < '%s' 2>/dev/null", inp, diffp);
-    int rc = system(cmd);
+    char *argv[] = { "patch", "--merge", "-s", "-p1", inp, NULL };
+    int rc = run_prog(argv, diffp, NULL); /* stdin <- diffp, edits inp in place */
     if (rc != 0 && rc != 1) {
-        snprintf(cmd, sizeof cmd, "patch --merge -s -p0 '%s' < '%s' 2>/dev/null", inp, diffp);
-        rc = system(cmd);
+        char *argv0[] = { "patch", "--merge", "-s", "-p0", inp, NULL };
+        rc = run_prog(argv0, diffp, NULL);
     }
     if (rc != 0 && rc != 1) return -1;
 

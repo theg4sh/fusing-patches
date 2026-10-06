@@ -55,6 +55,8 @@ ssize_t ps_read(ps_store *ps, ps_session *s, char *buf, size_t size, off_t off);
 int ps_truncate(ps_store *ps, ps_session *s, off_t size);
 int ps_session_fd(ps_session *s);
 int ps_session_dirty(ps_session *s);
+/* Non-zero if actual write()s happened (truncate alone does not count). */
+int ps_session_written(ps_session *s);
 /* Non-zero if this session writes to the merge snapshot (resolution). */
 int ps_session_is_merge(ps_session *s);
 
@@ -120,6 +122,14 @@ int ps_mount_unregister(ps_store *ps, ps_kind kind);
 /* Materialize every un-rejected patch/merge into the origin (lower) fs.
  * Returns the number of files written, or -1 on error. */
 int ps_apply_to_origin(ps_store *ps);
+
+/* 1 if the lower/origin content changed since we snapshotted our base. */
+int ps_origin_changed(ps_store *ps, const char *relpath);
+
+/* For every patched file whose origin changed behind our stack, emit a 3-way
+ * diff-conflict (diff3 -m base/theirs/ours) to stderr + messages/. Returns the
+ * number of conflicting files. */
+int ps_report_origin_conflicts(ps_store *ps);
 
 /* Reject `relpath`: clear all patch/merge state so it reverts to origin. */
 int ps_reject(ps_store *ps, const char *relpath);

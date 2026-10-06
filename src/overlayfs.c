@@ -338,10 +338,21 @@ static int ov_open(const char *path, struct fuse_file_info *fi) {
         }
     }
 
+    /* The kernel stripped O_CREAT because its LOOKUP saw the file, but a
+     * concurrent commit can briefly make it invisible (session removed /
+     * patch not yet visible). Absorb that window: retry, then treat the
+     * write-open as a create instead of failing with ENOENT. */
     if (is_write && !exists && !(fi->flags & O_CREAT)) {
-        free(h->relpath);
-        free(h);
-        return -ENOENT;
+        for (int i = 0; i < 20 && !exists; i++) {
+            usleep(500);
+            if (ps_resolve(ov->ps, path, blob, sizeof blob, &seq) != PS_SRC_LOWER) {
+                exists = 1;
+            } else {
+                off_t asize;
+                if (ps_active_size(ov->ps, path, &asize)) exists = 1;
+            }
+        }
+        /* still invisible -> proceed as a fresh create (caller had O_CREAT) */
     }
 
     if (is_write) {
@@ -460,8 +471,16 @@ static int ov_flush(const char *path, struct fuse_file_info *fi) {
 
     if (!ps_session_dirty(h->sess)) return 0;
 
-    /* merge (resolution) writes are never soft-blocked */
-    if (ps_session_is_merge(h->sess)) return 0;
+    /* a flush with no writes yet is not the end of the edit (e.g. shell
+     * redirection dup2/close); keep the session for the writes to come */
+    if (!ps_session_written(h->sess)) return 0;
+
+    /* merge (resolution) writes commit here; close() waits for flush */
+    if (ps_session_is_merge(h->sess)) {
+        ps_commit(OVERLAY_DATA->ps, h->sess);
+        h->sess = NULL;
+        return 0;
+    }
 
     /* soft-block: report + reject the close, so the writer re-syncs */
     if (ps_check_conflict(OVERLAY_DATA->ps, h->sess)) {
@@ -469,6 +488,11 @@ static int ov_flush(const char *path, struct fuse_file_info *fi) {
         ps_report_conflict(OVERLAY_DATA->ps, h->sess);
         return -EAGAIN;
     }
+
+    /* commit synchronously: close() waits for flush, so the next open on
+     * this mount observes the committed state (no async-release window) */
+    ps_commit(OVERLAY_DATA->ps, h->sess);
+    h->sess = NULL;
     return 0;
 }
 
@@ -591,6 +615,11 @@ static int ov_unlink(const char *path) {
 static void *ov_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     (void)conn;
     cfg->use_ino = 0;
+    /* no dentry/attribute caching: every open re-validates against the
+     * store, avoiding stale-lookup races with concurrent commits */
+    cfg->entry_timeout = 0;
+    cfg->negative_timeout = 0;
+    cfg->attr_timeout = 0;
     struct overlay *ov = OVERLAY_DATA;
     ps_mount_register(ov->ps, ov->kind);
     return ov;

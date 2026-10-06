@@ -6,11 +6,23 @@ PKG_LIBS   = $(shell pkg-config --libs fuse3)
 SRC = src/overlayfs.c src/patchstore.c
 OBJ = $(SRC:src/%.c=build/%.o)
 BIN = build/overlayfs
+STRESS = build/stress
 
-all: $(BIN)
+all: $(BIN) $(STRESS)
 
 $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(PKG_LIBS)
+
+$(STRESS): stress/stress.c
+	@mkdir -p build
+	$(CC) -O2 -Wall -Wextra -Wno-format-truncation -pthread -o $@ stress/stress.c
+
+# native C stress harness (multithreaded); replaces the old shell stress scripts
+stress-test: $(STRESS) $(BIN)
+	$(STRESS) $(BIN) --threads=2 --noop=200 --verify
+
+stress-long: $(STRESS) $(BIN)
+	$(STRESS) $(BIN) --duration=$(STRESS_DURATION) --threads=3 --verify
 
 build/%.o: src/%.c src/patchstore.h
 	@mkdir -p build
@@ -44,4 +56,4 @@ static: $(FUSE_LIB) $(SRC) src/patchstore.h
 clean:
 	rm -rf build
 
-.PHONY: all static clean
+.PHONY: all static clean stress-test stress-long

@@ -8,7 +8,7 @@
 # overlapping) ranges are accepted as small pieces.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BIN="${BIN:-$HERE/build/overlayfs}"
+BIN="${BIN:-$HERE/../build/overlayfs}"
 
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }

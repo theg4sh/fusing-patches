@@ -160,7 +160,46 @@ $ ldd build/overlayfs-static
 
 ---
 
-## 10. Usage
+## 10. Concurrency & correctness (FUSE usage)
+
+- **Commits are synchronous with `close()`.** The patch commit runs in the
+  `flush` handler, whose completion the kernel's `close()` waits for.
+  (`release` is processed asynchronously by libfuse, so committing there left
+  a window where the next `open()` could observe pre-commit state — a real
+  race found by the C stress harness.) `release` remains as a fallback for
+  truncate-only edits.
+- **`flush` ≠ end of edit.** Shell redirection (dup2/close) can fire `flush`
+  before the writes arrive, so a flush only commits once real `write()`s
+  occurred (`ps_session_written`).
+- **No kernel dentry caching.** `entry_timeout = negative_timeout =
+  attr_timeout = 0`, since store state changes behind the kernel's back.
+  `open` on a transiently-invisible file retries briefly and then proceeds as
+  a create (the caller had `O_CREAT`; the kernel stripped it after its
+  LOOKUP succeeded).
+- **Current content = latest *opened* patch**, not highest seq: async commits
+  can land out of order, so seq order ≠ write order. Resolution orders
+  patches/merges by `opened_at` (tie-break by seq).
+
+## 11. Security review — issues found & fixed
+
+| # | Issue | Severity | Fix |
+|---|-------|----------|-----|
+| 1 | **Command injection**: `diff`/`diff3`/`patch` invoked via `system()`/`popen()` with paths built from FUSE filenames (a filename containing `'` escapes into the shell) | high | all external tools now run via `fork`+`execvp` with an argument array (`run_prog`), I/O redirected with `dup2` — no shell involved |
+| 2 | **Data race**: process-local `ps->seq++` for temp-file names | low | `__atomic_add_fetch` |
+| 3 | **Torn meta reads**: `mark_pending_accepted` rewrote the patch index in place while other threads read it | low | write temp + atomic `rename` |
+| 4 | **Lost write / stale content**: highest-`seq`-wins wrong when async commits land out of order | high (data) | resolution orders by `opened_at` (see §10) |
+| 5 | **ENOENT on `open(O_CREAT)`**: async `release`-commit window vs the next open | medium | commit moved to `flush` (synchronous) + `entry_timeout=0` + tolerant `open` (§10) |
+
+Remaining known limitations (documented, not fixed):
+- Path encoding buffers are fixed-size; >PATH_MAX/3 encoded names are silently
+  truncated (collision risk for pathological names).
+- The patch-index append (`fopen "a"`) relies on O_APPEND atomicity for
+  single-line writes; a full rewrite+rename would be needed for large lines.
+- Same-owner writes that *read* a stale base (open before the previous commit)
+  are treated as last-writer-wins, not conflicts; cross-owner overlaps are
+  caught by the range-based soft-block.
+
+## 12. Usage
 
 ```bash
 make                       # dynamic dev build -> build/overlayfs
@@ -182,11 +221,11 @@ privilege), which is not a library dependency.
 
 ---
 
-## 11. Tests
+## 13. Tests
 
 | Script | Covers |
 |--------|--------|
-| `test_merge.sh`   | passthrough, clean accept, soft-block + stderr + message, de-dup, re-sync retry, disjoint ranges, merge, lower untouched |
-| `stress_test.sh`  | high-frequency concurrent writes + no-op patch acceptance |
-| `stress_long.sh [sec]` | sustained stress (default 120 s) watching for stability |
-| `test_lifecycle.sh` | apply-to-origin, multi-level mounts, patch-view edit/reject, git-diff audit |
+| `tests/test_merge.sh`   | passthrough, clean accept, soft-block + stderr + message, de-dup, re-sync retry, disjoint ranges, merge, lower untouched |
+| `tests/test_lifecycle.sh` | apply-to-origin, multi-level mounts, patch-view edit/reject, git-diff audit |
+| `stress/stress_test.sh`  | high-frequency concurrent writes + no-op patch acceptance |
+| `stress/stress_long.sh [sec]` | sustained stress (default 120 s) watching for stability |
