@@ -42,6 +42,10 @@ Adversarial inputs of interest:
 | 7 | ht.h (vendored hash table) OOM: `ht__expand` on failed `malloc` leaves a NULL slot array that the rehash dereferences | medium | library patched internally: OOM-safe `ht__expand`/`ht__put` (returns NULL), hash clamp (no `+2` wrap into `HT__EMPTY`/`HT__DELETED` markers), tombstone-safe insert, overflow-guarded capacity math; upstream fix shipped as `patches/ht.h.patch` (applies to pristine ht.h with `patch -p0`) |
 | 8 | ht.h usage: `collect_path` used `*arr = realloc(*arr, …)` — leaks the old buffer on allocation failure | low | realloc via temp pointer, checked; `ht_put` results now NULL-checked (OOM degrades to unindexed session / dedup-skip, never a crash) |
 | 9 | ht.h usage audit: key lifetime (session `relpath` / strdup'd dedup keys), value-overwrite on duplicate keys, and delete identity checks verified; all `sessions_ht` ops under `ps->lock` | informational | audited, no defects found |
+| 10 | `x = realloc(x, …)` pattern in `rl_add`, `meta_load`, `slurp_file`, `split_diff`, `split_lines`, `ops_add`, `region_add_lines`, `build_regions`: lost buffer on allocation failure (leak / NULL deref / lost partial parse) | low | all converted to temp-pointer realloc with graceful degradation (partial parse kept, range skipped, -1 returned) |
+| 11 | World-readable store: files 0644, dirs 0755 | medium | daemon sets `umask(0077)`; store dirs/files now 0700/0600 |
+| 12 | Symlink escape on apply-to-origin: `copy_file_to_path` followed a symlink planted in the lower tree, redirecting the write elsewhere | medium | `O_NOFOLLOW` on the target open (write fails with ELOOP instead) |
+| 13 | Silent truncation of percent-encoded path names (`enc[4096]`): distinct paths could collide on the same truncated store filename | low | `encode_path` detects truncation (returns -1, empty name → clean failure), buffers sized `ENC_MAX = 3*PATH_MAX+1` |
 
 ## 3. Remaining attack surface & known limitations
 
@@ -59,10 +63,11 @@ Not fixed — accepted or tracked:
    code; the project is MIT-licensed. A hand-rolled unified-diff applier would
    drop the last external tool.
 
-2. **Fixed-size path buffers**: path encoding (`encode_path`) silently
-   truncates for names whose encoded form exceeds the 4096-byte buffers —
-   collision risk for pathological names. FUSE paths are bounded by PATH_MAX
-   but the 3x percent-encoding expansion can exceed the buffer.
+2. ~~Fixed-size path buffers~~ **fixed**: `encode_path` now detects truncation
+   (returns -1, no silent collision) and encoding buffers are sized for the
+   worst case (`ENC_MAX = 3*PATH_MAX+1`). Paths whose encoded name still
+   exceeds the filesystem `NAME_MAX` fail loudly (ENAMETOOLONG) instead of
+   colliding — a hashed/nested naming scheme would fully lift that limit.
 
 3. **Patch-index append atomicity**: `meta` appends rely on O_APPEND atomicity
    for single-line writes (< PIPE_BUF). Safe today; a rewrite+rename scheme
@@ -72,19 +77,21 @@ Not fixed — accepted or tracked:
    its own previous commit landed silently overwrites it. Only cross-owner
    range overlaps are soft-blocked. Documented semantics, not a bug.
 
-5. **No privilege separation**: the daemon runs with the caller's uid; store
-   files are mode 0644/0755 (world-readable). Messages may contain file
-   content diffs. Consider 0700 dirs/0600 files in a multi-user deployment.
+5. ~~No privilege separation~~ **fixed**: the daemon sets `umask(0077)` and
+   creates store dirs/files 0700/0600, so patches/messages are no longer
+   world-readable.
 
-6. **`fork()`-in-threaded-daemon**: `run_prog` is invoked from FUSE worker
-   threads. The child only calls `open`/`dup2`/`close`/`execvp` before
-   `exec`, which is async-signal-safe; keep it that way — no malloc in the
-   child path.
+6. **`fork()`-in-threaded-daemon**: `run_prog` (only `patch` remains) is
+   invoked from FUSE worker threads. The child only calls `open`/`dup2`/
+   `close`/`execvp` before `exec`, which is async-signal-safe; keep it that
+   way — no malloc in the child path.
 
 7. **Symlink/`..` handling**: relpaths are used as-is in `lower_path`
-   (lower + "/" + relpath). A malicious path component is confined to the
-   lower subtree only if the lower itself contains no symlinks pointing
-   outside. The overlay does not follow symlinks for its own state.
+   (lower + "/" + relpath). Apply-to-origin now opens the target with
+   `O_NOFOLLOW`, so an attacker-planted symlink in the lower tree cannot
+   redirect writes outside it. Intermediate directory components that are
+   symlinks are still followed (full fix: `openat2(RESOLVE_BENEATH)`).
+   The overlay does not follow symlinks for its own state.
 
 ## 4. Secure-development checklist
 

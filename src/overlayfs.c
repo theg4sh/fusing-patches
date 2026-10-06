@@ -665,6 +665,10 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    /* store contents (patches, messages) may hold file data: create
+     * everything 0600/0700 regardless of the caller's umask */
+    umask(0077);
+
     if (argc < 4) {
         usage(argv[0]);
         return 2;

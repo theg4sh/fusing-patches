@@ -29,9 +29,14 @@ static int split_lines(const char *buf, size_t len, struct slice **out) {
     for (size_t i = 0; i < len; i++) {
         if (buf[i] == '\n') {
             if (n == cap) {
-                cap = cap ? cap * 2 : 256;
-                lines = realloc(lines, (size_t)cap * sizeof *lines);
-                if (!lines) return -1;
+                size_t ncap = cap ? (size_t)cap * 2 : 256;
+                struct slice *tmp = realloc(lines, ncap * sizeof *lines);
+                if (!tmp) {
+                    free(lines);
+                    return -1;
+                }
+                lines = tmp;
+                cap = (int)ncap;
             }
             lines[n].ptr = buf + start;
             lines[n].len = i - start + 1; /* include '\n' */
@@ -41,9 +46,14 @@ static int split_lines(const char *buf, size_t len, struct slice **out) {
     }
     if (start < len) { /* last line without trailing newline */
         if (n == cap) {
-            cap = cap ? cap * 2 : 256;
-            lines = realloc(lines, (size_t)cap * sizeof *lines);
-            if (!lines) return -1;
+            size_t ncap = cap ? (size_t)cap * 2 : 256;
+            struct slice *tmp = realloc(lines, ncap * sizeof *lines);
+            if (!tmp) {
+                free(lines);
+                return -1;
+            }
+            lines = tmp;
+            cap = (int)ncap;
         }
         lines[n].ptr = buf + start;
         lines[n].len = len - start;
@@ -85,9 +95,11 @@ struct ops_list {
 
 static int ops_add(struct ops_list *L, int type, int a0, int a1, int b0, int b1) {
     if (L->n == L->cap) {
-        L->cap = L->cap ? L->cap * 2 : 64;
-        L->ops = realloc(L->ops, (size_t)L->cap * sizeof *L->ops);
-        if (!L->ops) return -1;
+        size_t ncap = L->cap ? (size_t)L->cap * 2 : 64;
+        struct op *tmp = realloc(L->ops, ncap * sizeof *L->ops);
+        if (!tmp) return -1;
+        L->ops = tmp;
+        L->cap = (int)ncap;
     }
     L->ops[L->n++] = (struct op){ type, a0, a1, b0, b1 };
     return 0;
@@ -328,9 +340,11 @@ struct region {
 static int region_add_lines(struct region *r, const struct slice *src, int b0, int b1) {
     for (int k = b0; k < b1; k++) {
         if (r->nlines == r->cap) {
-            r->cap = r->cap ? r->cap * 2 : 16;
-            r->lines = realloc(r->lines, (size_t)r->cap * sizeof *r->lines);
-            if (!r->lines) return -1;
+            size_t ncap = r->cap ? (size_t)r->cap * 2 : 16;
+            struct slice *tmp = realloc(r->lines, ncap * sizeof *r->lines);
+            if (!tmp) return -1;
+            r->lines = tmp;
+            r->cap = (int)ncap;
         }
         r->lines[r->nlines++] = src[k];
     }
@@ -350,8 +364,9 @@ static int build_regions(struct op *ops, int nops, struct slice *b,
             continue;
         }
         if (!cur || o->a0 > cur->end) {
-            regions = realloc(regions, (size_t)(nr + 1) * sizeof *regions);
-            if (!regions) return -1;
+            struct region *tmp = realloc(regions, (size_t)(nr + 1) * sizeof *regions);
+            if (!tmp) return -1;
+            regions = tmp;
             cur = &regions[nr++];
             memset(cur, 0, sizeof *cur);
             cur->start = o->a0;

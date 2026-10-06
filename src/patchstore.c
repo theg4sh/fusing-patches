@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,6 +77,9 @@ struct patchrec {
 /* murmur-hashed string set (ht.h), for O(1) path dedup */
 typedef Ht(const char *, int) strset_t;
 
+/* worst-case percent-encoding expansion of a FUSE path: 3x + NUL */
+#define ENC_MAX (3 * PATH_MAX + 1)
+
 static uintptr_t path_hasheq(Ht_Op op, void const *a, void const *b, size_t n);
 
 /* ------------------------------------------------------------------ */
@@ -92,7 +96,7 @@ static int ensure_dir(const char *path) {
     struct stat st;
     if (stat(path, &st) == 0)
         return S_ISDIR(st.st_mode) ? 0 : -1;
-    if (mkdir(path, 0755) != 0 && errno != EEXIST) return -1;
+    if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
     return 0;
 }
 
@@ -100,14 +104,23 @@ static void make_subdir(const char *store_dir, const char *name, char *out, size
     snprintf(out, out_sz, "%s/%s", store_dir, name);
 }
 
-static void encode_path(const char *relpath, char *out, size_t out_sz) {
+/* percent-encode every byte -> safe flat filename.
+ * Returns 0 on success, -1 if the output buffer was too small (no silent
+ * truncation: a truncated name could collide with another path's name). */
+static int encode_path(const char *relpath, char *out, size_t out_sz) {
     static const char hex[] = "0123456789ABCDEF";
     size_t i = 0;
     const char *p = relpath;
-    while (*p && i + 4 <= out_sz) {
+    while (*p) {
         unsigned char c = (unsigned char)*p;
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_') {
+        size_t need = ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                       (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_')
+                          ? 1 : 3;
+        if (i + need + 1 > out_sz) {
+            out[0] = '\0';
+            return -1;
+        }
+        if (need == 1) {
             out[i++] = (char)c;
         } else {
             out[i++] = '%';
@@ -117,6 +130,7 @@ static void encode_path(const char *relpath, char *out, size_t out_sz) {
         p++;
     }
     out[i] = '\0';
+    return 0;
 }
 
 static int hexval(char c) {
@@ -140,22 +154,31 @@ static void decode_path(const char *enc, char *out, size_t out_sz) {
 }
 
 static int meta_path(ps_store *ps, const char *relpath, char *out, size_t out_sz) {
-    char enc[4096];
-    encode_path(relpath, enc, sizeof enc);
+    char enc[ENC_MAX];
+    if (encode_path(relpath, enc, sizeof enc) != 0) {
+        out[0] = '\0';
+        return -1;
+    }
     snprintf(out, out_sz, "%s/meta/%s", ps->store_dir, enc);
     return 0;
 }
 
 static int merge_blob_path(ps_store *ps, const char *relpath, char *out, size_t out_sz) {
-    char enc[4096];
-    encode_path(relpath, enc, sizeof enc);
+    char enc[ENC_MAX];
+    if (encode_path(relpath, enc, sizeof enc) != 0) {
+        out[0] = '\0';
+        return -1;
+    }
     snprintf(out, out_sz, "%s/merge/%s.blob", ps->store_dir, enc);
     return 0;
 }
 
 static int merge_meta_path(ps_store *ps, const char *relpath, char *out, size_t out_sz) {
-    char enc[4096];
-    encode_path(relpath, enc, sizeof enc);
+    char enc[ENC_MAX];
+    if (encode_path(relpath, enc, sizeof enc) != 0) {
+        out[0] = '\0';
+        return -1;
+    }
     snprintf(out, out_sz, "%s/merge/%s.meta", ps->store_dir, enc);
     return 0;
 }
@@ -176,8 +199,11 @@ static int ranges_path(ps_store *ps, const char *id, char *out, size_t out_sz) {
 }
 
 static int origin_path(ps_store *ps, const char *relpath, char *out, size_t out_sz) {
-    char enc[4096];
-    encode_path(relpath, enc, sizeof enc);
+    char enc[ENC_MAX];
+    if (encode_path(relpath, enc, sizeof enc) != 0) {
+        out[0] = '\0';
+        return -1;
+    }
     snprintf(out, out_sz, "%s/origin/%s", ps->store_dir, enc);
     return 0;
 }
@@ -189,8 +215,11 @@ static int origin_path(ps_store *ps, const char *relpath, char *out, size_t out_
 static void rl_add(struct rangelist *rl, off_t lo, off_t hi) {
     if (hi <= lo) return;
     if (rl->n == rl->cap) {
-        rl->cap = rl->cap ? rl->cap * 2 : 8;
-        rl->r = realloc(rl->r, sizeof(*rl->r) * rl->cap);
+        size_t ncap = rl->cap ? (size_t)rl->cap * 2 : 8;
+        struct range *tmp = realloc(rl->r, sizeof(*rl->r) * ncap);
+        if (!tmp) return; /* OOM: range not recorded (degraded conflict check) */
+        rl->r = tmp;
+        rl->cap = (int)ncap;
     }
     rl->r[rl->n].lo = lo;
     rl->r[rl->n].hi = hi;
@@ -261,7 +290,7 @@ static int64_t next_seq(ps_store *ps) {
     char lp[4096], sp[4096];
     snprintf(lp, sizeof lp, "%s/seq.lock", ps->store_dir);
     snprintf(sp, sizeof sp, "%s/seq", ps->store_dir);
-    int lfd = open(lp, O_RDWR | O_CREAT, 0644);
+    int lfd = open(lp, O_RDWR | O_CREAT, 0600);
     if (lfd < 0) return -1;
     flock(lfd, LOCK_EX);
     int64_t cur = seq_read(ps);
@@ -349,8 +378,15 @@ static int meta_load(ps_store *ps, const char *relpath, struct patchrec **out) {
         if (sscanf(line, "P %63s %lld %lld %lld %63s %lld %c",
                    id, &opened, &committed, &size, owner, &seq, &state) == 7) {
             if (n == cap) {
-                cap = cap ? cap * 2 : 8;
-                recs = realloc(recs, sizeof(*recs) * cap);
+                size_t ncap = cap ? (size_t)cap * 2 : 8;
+                struct patchrec *tmp = realloc(recs, sizeof(*recs) * ncap);
+                if (!tmp) {
+                    fclose(f);
+                    *out = recs; /* return what was parsed so far */
+                    return n;
+                }
+                recs = tmp;
+                cap = (int)ncap;
             }
             struct patchrec *r = &recs[n];
             memset(r, 0, sizeof *r);
@@ -480,7 +516,7 @@ static void snapshot_origin(ps_store *ps, const char *relpath) {
     struct stat st;
     if (stat(lp, &st) != 0 || !S_ISREG(st.st_mode)) return;
 
-    int fd = open(op, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(op, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return;
     copy_path_into(lp, fd);
     close(fd);
@@ -522,7 +558,7 @@ static ps_session *begin_common(ps_store *ps, const char *relpath, int exists, i
              (long long)s->opened_at, __atomic_add_fetch(&ps->seq, 1, __ATOMIC_RELAXED));
     s->tmp_path = strdup(tmp);
 
-    s->fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    s->fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (s->fd < 0) goto fail;
 
     if (seed_session(ps, s, exists) != 0) goto fail;
@@ -670,7 +706,7 @@ static int run_prog(char *const argv[], const char *stdin_path, const char *stdo
             }
         }
         if (stdout_path) {
-            int fd = open(stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = open(stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
             if (fd >= 0) {
                 dup2(fd, 1);
                 close(fd);
@@ -704,11 +740,13 @@ static int slurp_file(const char *path, char **out, size_t *out_len) {
         if (len + (size_t)r > cap) {
             cap = cap ? cap * 2 : 65536;
             while (cap < len + (size_t)r) cap *= 2;
-            buf = realloc(buf, cap);
-            if (!buf) {
+            char *tmp = realloc(buf, cap);
+            if (!tmp) {
                 close(fd);
+                free(buf);
                 return -1;
             }
+            buf = tmp;
         }
         memcpy(buf + len, chunk, (size_t)r);
         len += (size_t)r;
@@ -771,8 +809,11 @@ static int base_content_path(ps_store *ps, const char *relpath, int64_t base_seq
 
 static void reported_path(ps_store *ps, const char *owner, const char *relpath,
                           char *out, size_t out_sz) {
-    char enc[4096];
-    encode_path(relpath, enc, sizeof enc);
+    char enc[ENC_MAX];
+    if (encode_path(relpath, enc, sizeof enc) != 0) {
+        out[0] = '\0'; /* truncated name: no collision, fails at open() */
+        return;
+    }
     snprintf(out, out_sz, "%s/messages/%s/.reported/%s", ps->store_dir, owner, enc);
 }
 
@@ -819,7 +860,7 @@ static void write_message(ps_store *ps, ps_session *s, int64_t seq) {
     int have_base = base_content_path(ps, s->relpath, s->base_seq, base, sizeof base);
     if (!have_base) {
         snprintf(base, sizeof base, "%s/tmp/empty-%lld", ps->store_dir, (long long)now_ns());
-        int fd = open(base, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = open(base, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0) close(fd);
     }
     char cur[4096];
@@ -1297,7 +1338,7 @@ void ps_mount_register(ps_store *ps, ps_kind kind) {
     ensure_dir(dir);
     char f[4096];
     snprintf(f, sizeof f, "%s/%s.%s.%ld", dir, kind_name(kind), ps->owner, (long)getpid());
-    int fd = open(f, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(f, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) close(fd);
 }
 
@@ -1335,9 +1376,11 @@ static void ensure_parent_dirs(const char *path) {
     }
 }
 
+/* write a whole file into the origin tree: no symlink following (an
+ * attacker-controlled lower symlink must not redirect writes elsewhere) */
 static int copy_file_to_path(const char *src, const char *dst) {
     ensure_parent_dirs(dst);
-    int fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
     int rc = copy_path_into(src, fd);
     close(fd);
@@ -1607,7 +1650,7 @@ static int merge_put_fd(ps_store *ps, const char *relpath, int content_fd, off_t
     if (seq < 0) return -1;
     char mb[4096];
     merge_blob_path(ps, relpath, mb, sizeof mb);
-    int fd = open(mb, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(mb, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return -1;
     if (copy_fd_to_fd(content_fd, fd) != 0) {
         close(fd);
@@ -1682,17 +1725,23 @@ static int split_diff(const char *diff, struct diff_seg **out) {
         }
         if (new_seg && !cur_path && newpath[0]) {
             if (n == c) {
-                c = c ? c * 2 : 8;
-                segs = realloc(segs, sizeof(*segs) * c);
+                size_t ncap = c ? (size_t)c * 2 : 8;
+                struct diff_seg *tmp = realloc(segs, sizeof(*segs) * ncap);
+                if (!tmp) goto oom;
+                segs = tmp;
+                c = (int)ncap;
             }
             segs[n].path = strdup(newpath);
+            if (!segs[n].path) goto oom;
             segs[n].text = NULL;
             cur_path = segs[n].path;
             n++;
         }
         if (cur_path) {
             size_t l = strlen(line);
-            cur_text = realloc(cur_text, cur_len + l + 1);
+            char *tmp = realloc(cur_text, cur_len + l + 1);
+            if (!tmp) goto oom;
+            cur_text = tmp;
             memcpy(cur_text + cur_len, line, l);
             cur_len += l;
             cur_text[cur_len] = '\0';
@@ -1705,6 +1754,18 @@ static int split_diff(const char *diff, struct diff_seg **out) {
     fclose(f);
     *out = segs;
     return n;
+
+oom:
+    free(line);
+    fclose(f);
+    for (int i = 0; i < n; i++) {
+        free(segs[i].path);
+        free(segs[i].text);
+    }
+    free(segs);
+    free(cur_text);
+    *out = NULL;
+    return -1;
 }
 
 /* write a conflict message (real diff-conflict) to stderr + messages/ */
@@ -1741,7 +1802,7 @@ static int apply_file_diff(ps_store *ps, const char *relpath, const char *seg) {
     if (src == PS_SRC_LOWER)
         lower_path(ps, relpath, cur, sizeof cur);
 
-    int ifd = open(inp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int ifd = open(inp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (ifd < 0) return -1;
     if (copy_path_into(cur, ifd) != 0) { close(ifd); return -1; }
     close(ifd);
@@ -1779,6 +1840,7 @@ static int apply_file_diff(ps_store *ps, const char *relpath, const char *seg) {
 int ps_apply_gitdiff(ps_store *ps, const char *diff_text) {
     struct diff_seg *segs = NULL;
     int n = split_diff(diff_text, &segs);
+    if (n < 0) return 0; /* OOM during splitting */
     int applied = 0;
     for (int i = 0; i < n; i++) {
         char relpath[4096];
