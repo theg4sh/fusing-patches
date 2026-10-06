@@ -180,6 +180,26 @@ $ ldd build/overlayfs-static
   can land out of order, so seq order ≠ write order. Resolution orders
   patches/merges by `opened_at` (tie-break by seq).
 
+## 10.1 In-process diff engine & fast search
+
+- `src/diff.c` implements the unified-diff producer (`diff_unified`, Myers
+  O(ND) with linear backtracking) and a git-style 3-way merge with conflict
+  markers (`merge3`), replacing `diff -u` and `diff3 -m`. Diff inputs larger
+  than 2048 total lines fall back to a coarse replace-all edit script.
+- Fast path lookups use a vendored hash table (`src/ht.h`, tsoding/ht.h,
+  MIT/Public Domain): active sessions are indexed by relpath
+  (`ps->sessions_ht`, O(1) `ps_active_size`) and apply-to-origin path dedup is
+  O(1) via a murmur3-hashed string set.
+- Path keys are hashed with murmur3 32-bit (public domain, byte-wise,
+  alignment-safe implementation in `src/patchstore.c`).
+
+## 10.2 Licensing
+
+The project is **MIT-licensed** (`LICENSE`). Vendored code: `src/ht.h`
+(MIT/Public Domain) and the murmur3 hash (public domain). The diff engine is
+original code — no LGPL/GPL components are used or linked, so the static
+binary is redistributable under MIT.
+
 ## 11. Security review — issues found & fixed
 
 | # | Issue | Severity | Fix |

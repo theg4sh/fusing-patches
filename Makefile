@@ -3,10 +3,11 @@ CFLAGS  ?= -O2 -g -Wall -Wextra -DFUSE_USE_VERSION=31 -Wno-format-truncation
 PKG_CFLAGS = $(shell pkg-config --cflags fuse3)
 PKG_LIBS   = $(shell pkg-config --libs fuse3)
 
-SRC = src/overlayfs.c src/patchstore.c
+SRC = src/overlayfs.c src/patchstore.c src/diff.c
 OBJ = $(SRC:src/%.c=build/%.o)
 BIN = build/overlayfs
 STRESS = build/stress
+DIFFTEST = build/difftest
 
 all: $(BIN) $(STRESS)
 
@@ -16,6 +17,13 @@ $(BIN): $(OBJ)
 $(STRESS): stress/stress.c
 	@mkdir -p build
 	$(CC) -O2 -Wall -Wextra -Wno-format-truncation -pthread -o $@ stress/stress.c
+
+$(DIFFTEST): tests/difftest.c src/diff.c src/diff.h
+	@mkdir -p build
+	$(CC) -O2 -Wall -Wextra -o $@ tests/difftest.c src/diff.c
+
+test-diff: $(DIFFTEST)
+	$(DIFFTEST)
 
 # native C stress harness (multithreaded); replaces the old shell stress scripts
 stress-test: $(STRESS) $(BIN)
@@ -45,15 +53,16 @@ $(FUSE_LIB):
 		-Dutils=false -Dexamples=false -Duseroot=false -Denable-io-uring=false
 	ninja -C $(FUSE_ROOT)/build
 
-static: $(FUSE_LIB) $(SRC) src/patchstore.h
+static: $(FUSE_LIB) $(SRC) src/patchstore.h src/diff.h
 	@mkdir -p build
 	$(CC) -O2 -DFUSE_USE_VERSION=31 $(FUSE_CFLAGS) -c src/overlayfs.c -o build/overlayfs_s.o
 	$(CC) -O2 -DFUSE_USE_VERSION=31 $(FUSE_CFLAGS) -c src/patchstore.c -o build/patchstore_s.o
-	$(CC) -static build/overlayfs_s.o build/patchstore_s.o $(FUSE_LIB) -lpthread -lrt -ldl -o build/overlayfs-static
+	$(CC) -O2 -DFUSE_USE_VERSION=31 $(FUSE_CFLAGS) -c src/diff.c -o build/diff_s.o
+	$(CC) -static build/overlayfs_s.o build/patchstore_s.o build/diff_s.o $(FUSE_LIB) -lpthread -lrt -ldl -o build/overlayfs-static
 	strip build/overlayfs-static
 	@echo ">>> built: build/overlayfs-static"
 
 clean:
 	rm -rf build
 
-.PHONY: all static clean stress-test stress-long
+.PHONY: all static clean stress-test stress-long test-diff

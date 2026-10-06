@@ -1,6 +1,28 @@
 #include "patchstore.h"
 
 #define _GNU_SOURCE 1
+#include "diff.h"
+#include <stdlib.h>
+
+/* ht.h uses plain malloc but its API has no error return; a failed allocation
+ * in ht__expand would leave a NULL slot array and be dereferenced during
+ * rehash. Convert OOM into a fatal error instead (daemon cannot recover). */
+static void *ht_fatal_malloc(size_t n) {
+    void *p = malloc(n);
+    if (!p && n) {
+        fprintf(stderr, "fatal: out of memory allocating %zu bytes\n", n);
+        abort();
+    }
+    return p;
+}
+#define HT_MALLOC ht_fatal_malloc
+#define HT_FREE free
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#define HT_IMPLEMENTATION 1
+#include "ht.h"
+#pragma GCC diagnostic pop
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,6 +46,7 @@ struct ps_store {
     char owner[64];
     pthread_mutex_t lock;
     ps_session *sessions;
+    Ht(const char *, ps_session *) sessions_ht; /* fast relpath -> session */
     long seq; /* process-local, temp-file naming only */
 };
 
@@ -63,6 +86,11 @@ struct patchrec {
     char state; /* 'A' accepted, 'P' pending (unused now) */
     struct rangelist ranges;
 };
+
+/* murmur-hashed string set (ht.h), for O(1) path dedup */
+typedef Ht(const char *, int) strset_t;
+
+static uintptr_t path_hasheq(Ht_Op op, void const *a, void const *b, size_t n);
 
 /* ------------------------------------------------------------------ */
 /* small helpers                                                       */
@@ -389,6 +417,7 @@ ps_store *ps_open(const char *store_dir, const char *lower_dir) {
     ps->store_dir = strdup(store_dir);
     ps->lower_dir = strdup(lower_dir);
     pthread_mutex_init(&ps->lock, NULL);
+    ps->sessions_ht.hasheq = path_hasheq;
 
     const char *subs[] = { "blobs", "meta", "merge", "mounts", "messages", "origin", "ranges", "tmp" };
     if (ensure_dir(ps->store_dir) != 0) goto fail;
@@ -406,6 +435,7 @@ fail:
 
 void ps_close(ps_store *ps) {
     if (!ps) return;
+    ht_free(&ps->sessions_ht);
     while (ps->sessions) {
         ps_session *s = ps->sessions;
         ps->sessions = s->next;
@@ -514,6 +544,7 @@ static ps_session *begin_common(ps_store *ps, const char *relpath, int exists, i
     pthread_mutex_lock(&ps->lock);
     s->next = ps->sessions;
     ps->sessions = s;
+    *ht_put(&ps->sessions_ht, s->relpath) = s;
     pthread_mutex_unlock(&ps->lock);
     return s;
 
@@ -670,21 +701,52 @@ static int run_prog(char *const argv[], const char *stdin_path, const char *stdo
     return -1;
 }
 
+/* read a whole file into a buffer; missing/unreadable file -> empty (len 0) */
+static int slurp_file(const char *path, char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    char chunk[65536];
+    ssize_t r;
+    while ((r = read(fd, chunk, sizeof chunk)) > 0) {
+        if (len + (size_t)r > cap) {
+            cap = cap ? cap * 2 : 65536;
+            while (cap < len + (size_t)r) cap *= 2;
+            buf = realloc(buf, cap);
+            if (!buf) {
+                close(fd);
+                return -1;
+            }
+        }
+        memcpy(buf + len, chunk, (size_t)r);
+        len += (size_t)r;
+    }
+    close(fd);
+    if (!buf) {
+        buf = malloc(1);
+        if (!buf) return -1;
+        buf[0] = '\0';
+    }
+    *out = buf;
+    *out_len = len;
+    return 0;
+}
+
 static void run_diff(ps_store *ps, const char *a, const char *b,
                      const char *label_a, const char *label_b, FILE *out) {
-    char tmpout[4096];
-    snprintf(tmpout, sizeof tmpout, "%s/tmp/diff.out", ps->store_dir);
-    char *argv[] = { "diff", "-u", "--label", (char *)label_a, "--label",
-                     (char *)label_b, (char *)a, (char *)b, NULL };
-    int rc = run_prog(argv, NULL, tmpout);
-    FILE *in = fopen(tmpout, "r");
-    if (!in) return;
-    char line[4096];
-    while (fgets(line, sizeof line, in))
-        fputs(line, out);
-    fclose(in);
+    (void)ps;
+    char *ab = NULL, *bb = NULL;
+    size_t alen = 0, blen = 0;
+    slurp_file(a, &ab, &alen);
+    slurp_file(b, &bb, &blen);
+    int rc = diff_unified(ab, alen, label_a, bb, blen, label_b, 3, out);
     if (rc == 0)
         fprintf(out, "(no differences)\n");
+    free(ab);
+    free(bb);
 }
 
 static int base_content_path(ps_store *ps, const char *relpath, int64_t base_seq,
@@ -818,6 +880,55 @@ void ps_report_conflict(ps_store *ps, ps_session *s) {
 }
 
 /* ------------------------------------------------------------------ */
+/* murmur3 32-bit (public domain, Austin Appleby) — byte-wise, alignment-safe */
+static uint32_t murmur3_32(const uint8_t *key, size_t len, uint32_t seed) {
+    uint32_t h = seed;
+    const uint32_t c1 = 0xcc9e2d51, c2 = 0x1b873593;
+    size_t i = 0;
+    for (; i + 4 <= len; i += 4) {
+        uint32_t k = (uint32_t)key[i] | ((uint32_t)key[i + 1] << 8) |
+                     ((uint32_t)key[i + 2] << 16) | ((uint32_t)key[i + 3] << 24);
+        k *= c1;
+        k = (k << 15) | (k >> 17);
+        k *= c2;
+        h ^= k;
+        h = (h << 13) | (h >> 19);
+        h = h * 5 + 0xe6546b64;
+    }
+    uint32_t k = 0;
+    switch (len & 3) {
+    case 3: k ^= (uint32_t)key[i + 2] << 16; /* fallthrough */
+    case 2: k ^= (uint32_t)key[i + 1] << 8;  /* fallthrough */
+    case 1: k ^= (uint32_t)key[i];
+        k *= c1;
+        k = (k << 15) | (k >> 17);
+        k *= c2;
+        h ^= k;
+    }
+    h ^= (uint32_t)len;
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h;
+}
+
+/* hasheq for C-string path keys, hashed with murmur3 */
+static uintptr_t path_hasheq(Ht_Op op, void const *a_, void const *b_, size_t n) {
+    (void)n;
+    char const *const *a = (char const *const *)a_;
+    switch (op) {
+    case HT_HASH:
+        return (uintptr_t)murmur3_32((const uint8_t *)*a, strlen(*a), 0x51ed2701);
+    case HT_EQ: {
+        char const *const *b = (char const *const *)b_;
+        return strcmp(*a, *b) == 0;
+    }
+    }
+    return 0;
+}
+
 /* commit                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -826,10 +937,13 @@ static void unlink_session(ps_store *ps, ps_session *s) {
     while (*pp) {
         if (*pp == s) {
             *pp = s->next;
-            return;
+            break;
         }
         pp = &(*pp)->next;
     }
+    ps_session **slot = ht_find(&ps->sessions_ht, s->relpath);
+    if (slot && *slot == s)
+        ht_delete(&ps->sessions_ht, slot);
 }
 
 static void session_free(ps_session *s) {
@@ -1079,14 +1193,12 @@ int ps_merge_resolve(ps_store *ps, const char *relpath, char *blob_out, size_t b
 int ps_active_size(ps_store *ps, const char *relpath, off_t *size_out) {
     int found = 0;
     pthread_mutex_lock(&ps->lock);
-    for (ps_session *s = ps->sessions; s; s = s->next) {
-        if (strcmp(s->relpath, relpath) == 0) {
-            struct stat st;
-            if (fstat(s->fd, &st) == 0) {
-                *size_out = st.st_size;
-                found = 1;
-            }
-            break;
+    ps_session **slot = ht_find(&ps->sessions_ht, relpath);
+    if (slot && *slot) {
+        struct stat st;
+        if (fstat((*slot)->fd, &st) == 0) {
+            *size_out = st.st_size;
+            found = 1;
         }
     }
     pthread_mutex_unlock(&ps->lock);
@@ -1243,7 +1355,7 @@ static int copy_file_to_path(const char *src, const char *dst) {
     return rc;
 }
 
-static void collect_path(char ***arr, int *n, int *cap, const char *rel);
+static void collect_path(strset_t *seen, char ***arr, int *n, int *cap, const char *rel);
 
 static int paths_equal(const char *a, const char *b) {
     int fa = open(a, O_RDONLY);
@@ -1296,11 +1408,11 @@ static int emit_origin_conflict(ps_store *ps, const char *relpath) {
     ps_src src = ps_resolve(ps, relpath, blob, sizeof blob, &seq);
     const char *ours = (src == PS_SRC_LOWER) ? lp : blob;
 
-    char outp[4096];
-    snprintf(outp, sizeof outp, "%s/tmp/diff3.out", ps->store_dir);
-    char *argv[] = { "diff3", "-m", "--label=base", "--label=theirs", "--label=ours",
-                     op, lp, (char *)ours, NULL };
-    int rc = run_prog(argv, NULL, outp);
+    char *base_buf = NULL, *theirs_buf = NULL, *ours_buf = NULL;
+    size_t base_len = 0, theirs_len = 0, ours_len = 0;
+    slurp_file(op, &base_buf, &base_len);
+    slurp_file(lp, &theirs_buf, &theirs_len);
+    slurp_file(ours, &ours_buf, &ours_len);
 
     char mdir[4096];
     snprintf(mdir, sizeof mdir, "%s/messages/%s", ps->store_dir, ps->owner);
@@ -1311,30 +1423,42 @@ static int emit_origin_conflict(ps_store *ps, const char *relpath) {
     snprintf(tmp, sizeof tmp, "%s.tmp", msg);
 
     FILE *out = fopen(tmp, "w");
-    if (!out) return -1;
+    if (!out) {
+        free(base_buf); free(theirs_buf); free(ours_buf);
+        return -1;
+    }
     const char *hdr = "ORIGIN CONFLICT on %s: the lower fs changed behind our stack:\n\n";
     fprintf(out, hdr, relpath);
     fprintf(stderr, hdr, relpath);
-    FILE *in = fopen(outp, "r");
-    if (in) {
-        char line[4096];
-        while (fgets(line, sizeof line, in)) {
-            fputs(line, out);
-            fputs(line, stderr);
-        }
-        fclose(in);
-    }
+
+    int rc = merge3(base_buf, base_len, theirs_buf, theirs_len,
+                    ours_buf, ours_len, out);
+
     const char *ftr = "\n(resolved above; conflict markers present if hunks overlap)\n";
     fprintf(out, "%s", ftr);
     fprintf(stderr, "%s", ftr);
     fclose(out);
+
+    /* mirror the merged output to stderr */
+    FILE *in = fopen(tmp, "r");
+    if (in) {
+        char line[4096];
+        while (fgets(line, sizeof line, in))
+            fputs(line, stderr);
+        fclose(in);
+    }
+
     rename(tmp, msg);
+    free(base_buf);
+    free(theirs_buf);
+    free(ours_buf);
     return rc == 1 ? 1 : 0;
 }
 
 int ps_report_origin_conflicts(ps_store *ps) {
     char **paths = NULL;
     int n = 0, cap = 0;
+    strset_t seen = { .hasheq = path_hasheq };
 
     char mdir[4096];
     snprintf(mdir, sizeof mdir, "%s/meta", ps->store_dir);
@@ -1345,7 +1469,7 @@ int ps_report_origin_conflicts(ps_store *ps) {
             if (e->d_name[0] == '.') continue;
             char rel[4096];
             decode_path(e->d_name, rel, sizeof rel);
-            collect_path(&paths, &n, &cap, rel);
+            collect_path(&seen, &paths, &n, &cap, rel);
         }
         closedir(d);
     }
@@ -1362,7 +1486,7 @@ int ps_report_origin_conflicts(ps_store *ps) {
             snprintf(base, sizeof base, "%.*s", (int)(len - 5), e->d_name);
             char rel[4096];
             decode_path(base, rel, sizeof rel);
-            collect_path(&paths, &n, &cap, rel);
+            collect_path(&seen, &paths, &n, &cap, rel);
         }
         closedir(d);
     }
@@ -1374,24 +1498,31 @@ int ps_report_origin_conflicts(ps_store *ps) {
         }
         free(paths[i]);
     }
+    ht_free(&seen);
     free(paths);
     return conflicts;
 }
 
-static void collect_path(char ***arr, int *n, int *cap, const char *rel) {
-    for (int i = 0; i < *n; i++)
-        if (strcmp((*arr)[i], rel) == 0) return;
+static void collect_path(strset_t *seen, char ***arr, int *n, int *cap, const char *rel) {
+    if (ht_find(seen, rel)) return;
     if (*n == *cap) {
-        *cap = *cap ? *cap * 2 : 16;
-        *arr = realloc(*arr, sizeof(**arr) * *cap);
+        size_t ncap = *cap ? (size_t)*cap * 2 : 16;
+        char **tmp = realloc(*arr, sizeof(**arr) * ncap);
+        if (!tmp) return; /* do not lose the old buffer on OOM */
+        *arr = tmp;
+        *cap = (int)ncap;
     }
-    (*arr)[*n] = strdup(rel);
+    char *copy = strdup(rel);
+    if (!copy) return;
+    *ht_put(seen, copy) = 1;
+    (*arr)[*n] = copy;
     (*n)++;
 }
 
 int ps_apply_to_origin(ps_store *ps) {
     char **paths = NULL;
     int n = 0, cap = 0;
+    strset_t seen = { .hasheq = path_hasheq };
 
     /* collect modified paths from patch index + merge index */
     char mdir[4096];
@@ -1403,7 +1534,7 @@ int ps_apply_to_origin(ps_store *ps) {
             if (e->d_name[0] == '.') continue;
             char rel[4096];
             decode_path(e->d_name, rel, sizeof rel);
-            collect_path(&paths, &n, &cap, rel);
+            collect_path(&seen, &paths, &n, &cap, rel);
         }
         closedir(d);
     }
@@ -1420,7 +1551,7 @@ int ps_apply_to_origin(ps_store *ps) {
             snprintf(base, sizeof base, "%.*s", (int)(len - 5), e->d_name);
             char rel[4096];
             decode_path(base, rel, sizeof rel);
-            collect_path(&paths, &n, &cap, rel);
+            collect_path(&seen, &paths, &n, &cap, rel);
         }
         closedir(d);
     }
@@ -1442,6 +1573,7 @@ int ps_apply_to_origin(ps_store *ps) {
         if (copy_file_to_path(blob, lp) == 0) applied++;
     }
     for (int i = 0; i < n; i++) free(paths[i]);
+    ht_free(&seen);
     free(paths);
     return applied;
 }

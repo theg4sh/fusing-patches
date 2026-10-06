@@ -39,20 +39,25 @@ Adversarial inputs of interest:
 | 4 | Lost write / stale content: commits can land out of order (async), so "highest seq wins" served older content | high (data integrity) | Content resolution orders patches/merges by `opened_at` (latest write wins), seq as tie-break |
 | 5 | Spurious `ENOENT` on `open(O_CREAT)`: the commit ran in `release`, which libfuse processes asynchronously; the next `open` could observe pre-commit state (kernel stripped `O_CREAT` after a successful LOOKUP) | medium | Commit moved to `flush` (synchronous with `close()`), guarded by a `written` flag (shell dup2/close can flush before writes); `release` is the fallback; `entry_timeout`/`negative_timeout`/`attr_timeout = 0`; `open` retries briefly and proceeds as create |
 | 6 | Test-path knowledge in production code (`/stress`, `noop.txt` left in `ps_resolve`) | low (hygiene) | removed |
+| 7 | ht.h (vendored hash table) OOM: `ht__expand` on failed `malloc` leaves a NULL slot array that the rehash dereferences (library API has no error return) | medium | `HT_MALLOC` overridden with a fatal-on-OOM allocator before the include |
+| 8 | ht.h usage: `collect_path` used `*arr = realloc(*arr, …)` — leaks the old buffer on allocation failure | low | realloc via temp pointer, checked |
+| 9 | ht.h usage audit: key lifetime (session `relpath` / strdup'd dedup keys), value-overwrite on duplicate keys, and delete identity checks verified; all `sessions_ht` ops under `ps->lock` | informational | audited, no defects found |
 
 ## 3. Remaining attack surface & known limitations
 
 Not fixed — accepted or tracked:
 
-1. **External tools still used at runtime** (`diff`, `diff3`, `patch` via
-   `run_prog`). Injection-free (argv arrays), but:
-   - the *static* binary still requires diffutils/patch on the target host;
+1. **One external tool still used at runtime**: `patch` (via `run_prog`) for
+   audit-diff application. Injection-free (argv arrays, no shell), but:
+   - the *static* binary still requires `patch` on the target host;
    - `run_prog` forks from multithreaded FUSE worker threads (child restricted
      to async-signal-safe calls before `exec`, so currently safe, but fragile);
-   - GNU tool behavior varies across versions (patch exit codes 0/1/2,
-     fuzz matching) — the code special-cases these.
-   Planned: in-process Myers diff + 3-way merge (`src/diff.{c,h}`), keeping
-   `patch` only for audit-diff application in the first milestone.
+   - GNU patch behavior varies across versions (exit codes 0/1/2, fuzz
+     matching) — the code special-cases these.
+   `diff -u` and `diff3 -m` were already replaced by the in-process
+   Myers-based engine (`src/diff.c`: `diff_unified`, `merge3`) — no LGPL/GPL
+   code; the project is MIT-licensed. A hand-rolled unified-diff applier would
+   drop the last external tool.
 
 2. **Fixed-size path buffers**: path encoding (`encode_path`) silently
    truncates for names whose encoded form exceeds the 4096-byte buffers —
@@ -102,9 +107,9 @@ Rules for any change to this codebase:
 
 ## 5. Recommendations
 
-1. Replace `diff`/`diff3` with the in-process engine (Myers unified diff +
-   three-way merge with conflict markers) — removes two runtime dependencies
-   and the fork-from-worker-thread concern for those paths.
+1. DONE: `diff`/`diff3` replaced by the in-process Myers engine
+   (`src/diff.c`: `diff_unified`, `merge3`) — two runtime dependencies and the
+   fork-from-worker-thread concern removed for those paths.
 2. Keep `patch` behind `run_prog` as the sole external tool until the
    unified-diff applier is implemented and pinned by tests, then drop it.
 3. Harden store permissions (0700/0600) for multi-user deployments.
