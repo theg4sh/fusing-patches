@@ -4,20 +4,6 @@
 #include "diff.h"
 #include <stdlib.h>
 
-/* ht.h uses plain malloc but its API has no error return; a failed allocation
- * in ht__expand would leave a NULL slot array and be dereferenced during
- * rehash. Convert OOM into a fatal error instead (daemon cannot recover). */
-static void *ht_fatal_malloc(size_t n) {
-    void *p = malloc(n);
-    if (!p && n) {
-        fprintf(stderr, "fatal: out of memory allocating %zu bytes\n", n);
-        abort();
-    }
-    return p;
-}
-#define HT_MALLOC ht_fatal_malloc
-#define HT_FREE free
-
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 #define HT_IMPLEMENTATION 1
@@ -544,7 +530,10 @@ static ps_session *begin_common(ps_store *ps, const char *relpath, int exists, i
     pthread_mutex_lock(&ps->lock);
     s->next = ps->sessions;
     ps->sessions = s;
-    *ht_put(&ps->sessions_ht, s->relpath) = s;
+    {
+        ps_session **slot = ht_put(&ps->sessions_ht, s->relpath);
+        if (slot) *slot = s; /* OOM: session stays list-reachable, just unindexed */
+    }
     pthread_mutex_unlock(&ps->lock);
     return s;
 
@@ -1514,7 +1503,10 @@ static void collect_path(strset_t *seen, char ***arr, int *n, int *cap, const ch
     }
     char *copy = strdup(rel);
     if (!copy) return;
-    *ht_put(seen, copy) = 1;
+    {
+        int *v = ht_put(seen, copy);
+        if (v) *v = 1; /* OOM: dedup degraded, but the path is still recorded */
+    }
     (*arr)[*n] = copy;
     (*n)++;
 }

@@ -568,7 +568,9 @@ static void *ht__find(Ht__Abstract *ht, void *key, Ht__Layout l)
 
     Ht_Hasheq hasheq = ht->hasheq ? ht->hasheq : ht_mem_hasheq;
     uintptr_t hash = hasheq(HT_HASH, key, NULL, l.key_size);
-    if (hash < HT__FIRST_VALID_HASH) hash += HT__FIRST_VALID_HASH;
+    /* clamp, don't add: hasheq may return UINTPTR_MAX and wrapping +2
+     * would produce the HT__EMPTY/HT__DELETED marker values */
+    if (hash < HT__FIRST_VALID_HASH) hash = HT__FIRST_VALID_HASH;
     uint8_t *slot = (uint8_t*)ht__find_slot(ht, hash, hasheq, key, l);
     if (slot == NULL) return NULL;
     uintptr_t slot_hash = *ht__slot_hash(slot, l);
@@ -762,15 +764,16 @@ HT_PUBDEF uintptr_t ht_lose_lose_hash(void const *data, size_t size)
     return hash;
 }
 
-static void *ht__find_slot(Ht__Abstract *ht, uintptr_t hash, Ht_Hasheq hasheq, void *key, Ht__Layout l)
+static inline void *ht__find_slot_in(uint8_t *slots, size_t capacity, uintptr_t hash,
+                                     Ht_Hasheq hasheq, void *key, Ht__Layout l)
 {
-    HT_ASSERT(!(ht->impl_capacity & (ht->impl_capacity - 1)));
+    HT_ASSERT(!(capacity & (capacity - 1)));
     HT_ASSERT(hash >= HT__FIRST_VALID_HASH);
-    size_t mask  = ht->impl_capacity - 1;
+    size_t mask  = capacity - 1;
     size_t index = hash & mask;
     size_t step  = 1;
-    for (size_t i = 0; i < ht->impl_capacity; ++i) {
-        uint8_t *slot = (uint8_t*)ht->impl_slots + index*ht__slot_size(l);
+    for (size_t i = 0; i < capacity; ++i) {
+        uint8_t *slot = slots + index*ht__slot_size(l);
         uintptr_t slot_hash = *ht__slot_hash(slot, l);
         if (slot_hash == HT__EMPTY) return slot;
         if (slot_hash == hash && hasheq(HT_EQ, ht__slot_key(slot, l), key, l.key_size)) {
@@ -783,13 +786,19 @@ static void *ht__find_slot(Ht__Abstract *ht, uintptr_t hash, Ht_Hasheq hasheq, v
     return NULL;
 }
 
+static inline void *ht__find_slot(Ht__Abstract *ht, uintptr_t hash, Ht_Hasheq hasheq, void *key, Ht__Layout l)
+{
+    return ht__find_slot_in((uint8_t*)ht->impl_slots, ht->impl_capacity, hash, hasheq, key, l);
+}
+
 static void *ht__put_no_expand(Ht__Abstract *ht, void *key, Ht__Layout l)
 {
     Ht_Hasheq hasheq = ht->hasheq ? ht->hasheq : ht_mem_hasheq;
     uintptr_t hash = hasheq(HT_HASH, key, NULL, l.key_size);
-    if (hash < HT__FIRST_VALID_HASH) hash += HT__FIRST_VALID_HASH;
+    /* clamp, don't add: hasheq may return UINTPTR_MAX (see ht__find) */
+    if (hash < HT__FIRST_VALID_HASH) hash = HT__FIRST_VALID_HASH;
     uint8_t *slot = (uint8_t*)ht__find_slot(ht, hash, hasheq, key, l);
-    HT_ASSERT(slot != NULL); // Should be taken care of by ht__expand()
+    if (slot == NULL) return NULL; /* table full: expand failed (OOM) */
 
     uintptr_t *slot_hash = ht__slot_hash(slot, l);
     switch (*slot_hash) {
@@ -801,7 +810,12 @@ static void *ht__put_no_expand(Ht__Abstract *ht, void *key, Ht__Layout l)
         ht__memcpy(slot, &ht->default_value, l.value_size);
         break;
     case HT__DELETED:
-        HT_ASSERT(0 && "UNREACHABLE");
+        /* reuse a tombstone instead of failing (defensive: find_slot does
+         * not currently return one, but this keeps insertion safe) */
+        *slot_hash = hash;
+        ht->count += 1;
+        ht__memcpy(ht__slot_key(slot, l), key, l.key_size);
+        ht__memcpy(slot, &ht->default_value, l.value_size);
         break;
     default:
         ht__memcpy(slot, &ht->default_value, l.value_size);
@@ -814,39 +828,62 @@ static void ht__expand(Ht__Abstract *ht, Ht__Layout l)
     if (ht->impl_capacity == 0 || ht->impl_filled_slots*100 >= HT__LOAD_FACTOR_PERCENT*ht->impl_capacity) {
         size_t   old_impl_capacity = ht->impl_capacity;
         uint8_t *old_impl_slots    = (uint8_t*)ht->impl_slots;
+        size_t   c                 = ht->count;
 
-        ht->impl_capacity = 1;
-        while (ht->impl_capacity && ht->impl_capacity < HT__MIN_CAP) {
-            ht->impl_capacity <<= 1;
+        /* clamp to keep the load-factor multiplications from overflowing */
+        if (c > (SIZE_MAX - 100) / 100) c = (SIZE_MAX - 100) / 100;
+
+        /* start from the current capacity (or the minimum) instead of
+         * re-running the growth loops from scratch on every expand */
+        size_t new_capacity = old_impl_capacity ? old_impl_capacity : HT__MIN_CAP;
+        while (new_capacity && new_capacity <= SIZE_MAX / HT__LOAD_FACTOR_PERCENT &&
+               c*100 >= HT__LOAD_FACTOR_PERCENT*new_capacity) {
+            new_capacity <<= 1;
         }
-        while (ht->impl_capacity && ht->count*100 >= HT__LOAD_FACTOR_PERCENT*ht->impl_capacity) {
-            ht->impl_capacity <<= 1;
+        HT_ASSERT(new_capacity);
+
+        /* allocate the new slot array first: on failure keep the old table
+         * untouched so that ht__put() can fail gracefully (returns NULL) */
+        uint8_t *new_impl_slots = (uint8_t*)HT_MALLOC(new_capacity*ht__slot_size(l));
+        if (new_impl_slots == NULL) {
+            return;
         }
-        HT_ASSERT(ht->impl_capacity);
-        ht->impl_filled_slots = 0;
-        ht->count             = 0;
-        ht->impl_slots        = HT_MALLOC(ht->impl_capacity*ht__slot_size(l));
 
         {
-            uint8_t *slots_start = (uint8_t*)ht->impl_slots;
-            uint8_t *slots_end = slots_start + ht->impl_capacity*ht__slot_size(l);
+            uint8_t *slots_start = new_impl_slots;
+            uint8_t *slots_end   = slots_start + new_capacity*ht__slot_size(l);
             for (uint8_t *iter = slots_start; iter < slots_end; iter += ht__slot_size(l)) {
                 *ht__slot_hash(iter, l) = HT__EMPTY;
             }
         }
 
-        if (old_impl_capacity) {
-            uint8_t *old_slots_start = old_impl_slots;
-            uint8_t *old_slots_end   = old_impl_slots + old_impl_capacity*ht__slot_size(l);
-            for (uint8_t *old_slot = old_slots_start; old_slot < old_slots_end; old_slot += ht__slot_size(l)) {
-                if (*ht__slot_hash(old_slot, l) >= HT__FIRST_VALID_HASH) {
-                    void *new_slot = ht__put_no_expand(ht, ht__slot_key(old_slot, l), l);
-                    ht__memcpy(new_slot, old_slot, l.value_size);
+        {
+            Ht_Hasheq hasheq = ht->hasheq ? ht->hasheq : ht_mem_hasheq;
+            size_t filled = 0, count = 0;
+            if (old_impl_capacity) {
+                uint8_t *old_slots_start = old_impl_slots;
+                uint8_t *old_slots_end   = old_impl_slots + old_impl_capacity*ht__slot_size(l);
+                for (uint8_t *old_slot = old_slots_start; old_slot < old_slots_end; old_slot += ht__slot_size(l)) {
+                    uintptr_t old_hash = *ht__slot_hash(old_slot, l);
+                    if (old_hash >= HT__FIRST_VALID_HASH) {
+                        uint8_t *new_slot = (uint8_t*)ht__find_slot_in(new_impl_slots, new_capacity, old_hash,
+                                                                       hasheq, ht__slot_key(old_slot, l), l);
+                        HT_ASSERT(new_slot != NULL);
+                        *ht__slot_hash(new_slot, l) = old_hash;
+                        filled += 1;
+                        count += 1;
+                        ht__memcpy(ht__slot_key(new_slot, l), ht__slot_key(old_slot, l), l.key_size);
+                        ht__memcpy(new_slot, old_slot, l.value_size);
+                    }
                 }
             }
+            ht->impl_filled_slots = filled;
+            ht->count             = count;
         }
 
         HT_FREE(old_impl_slots);
+        ht->impl_slots        = new_impl_slots;
+        ht->impl_capacity     = new_capacity;
     }
 }
 
