@@ -46,22 +46,20 @@ Adversarial inputs of interest:
 | 11 | World-readable store: files 0644, dirs 0755 | medium | daemon sets `umask(0077)`; store dirs/files now 0700/0600 |
 | 12 | Symlink escape on apply-to-origin: `copy_file_to_path` followed a symlink planted in the lower tree, redirecting the write elsewhere | medium | `O_NOFOLLOW` on the target open (write fails with ELOOP instead) |
 | 13 | Silent truncation of percent-encoded path names (`enc[4096]`): distinct paths could collide on the same truncated store filename | low | `encode_path` detects truncation (returns -1, empty name → clean failure), buffers sized `ENC_MAX = 3*PATH_MAX+1` |
+| 14 | Path traversal via git-diff headers: `+++ b/../../etc/passwd` made the overlay read arbitrary files as a diff base | high | `sanitize_relpath` rejects absolute paths and `.`/`..` components before use (verified: malicious diff rejected, target untouched) |
+| 15 | DoS via oversized inputs: audit diffs read from sparse `pwrite`s could `malloc(st_size+1)` unbounded; `slurp_file` grew unbounded on huge bases | medium | audit diffs capped at 16 MiB (rejected), diff bases capped at 64 MiB (`SLURP_MAX`) |
+| 16 | Last external tool `patch` (fork from multithreaded daemon, runtime dependency, version variance) | medium | replaced by the in-process applier `apply_unified_diff`; `run_prog` removed — the daemon never forks, no external tools remain |
 
 ## 3. Remaining attack surface & known limitations
 
 Not fixed — accepted or tracked:
 
-1. **One external tool still used at runtime**: `patch` (via `run_prog`) for
-   audit-diff application. Injection-free (argv arrays, no shell), but:
-   - the *static* binary still requires `patch` on the target host;
-   - `run_prog` forks from multithreaded FUSE worker threads (child restricted
-     to async-signal-safe calls before `exec`, so currently safe, but fragile);
-   - GNU patch behavior varies across versions (exit codes 0/1/2, fuzz
-     matching) — the code special-cases these.
-   `diff -u` and `diff3 -m` were already replaced by the in-process
-   Myers-based engine (`src/diff.c`: `diff_unified`, `merge3`) — no LGPL/GPL
-   code; the project is MIT-licensed. A hand-rolled unified-diff applier would
-   drop the last external tool.
+1. ~~One external tool at runtime~~ **fixed**: `patch` was replaced by the
+   in-process unified-diff applier (`src/diff.c: apply_unified_diff` — hunk
+   parsing, context matching with forward/backward offset search, git-style
+   conflict markers on unmatched hunks). **Zero external tools remain**:
+   the static binary has no runtime dependencies beyond the kernel, and
+   `run_prog`/fork was removed entirely.
 
 2. ~~Fixed-size path buffers~~ **fixed**: `encode_path` now detects truncation
    (returns -1, no silent collision) and encoding buffers are sized for the
@@ -81,17 +79,17 @@ Not fixed — accepted or tracked:
    creates store dirs/files 0700/0600, so patches/messages are no longer
    world-readable.
 
-6. **`fork()`-in-threaded-daemon**: `run_prog` (only `patch` remains) is
-   invoked from FUSE worker threads. The child only calls `open`/`dup2`/
-   `close`/`execvp` before `exec`, which is async-signal-safe; keep it that
-   way — no malloc in the child path.
+6. ~~`fork()`-in-threaded-daemon~~ **fixed**: `run_prog` was removed entirely
+   (all diff/merge/patch work is now in-process); the daemon never forks.
 
 7. **Symlink/`..` handling**: relpaths are used as-is in `lower_path`
    (lower + "/" + relpath). Apply-to-origin now opens the target with
    `O_NOFOLLOW`, so an attacker-planted symlink in the lower tree cannot
-   redirect writes outside it. Intermediate directory components that are
-   symlinks are still followed (full fix: `openat2(RESOLVE_BENEATH)`).
-   The overlay does not follow symlinks for its own state.
+   redirect writes outside it. Git-diff headers are sanitized (`sanitize_relpath`:
+   no `..`/`.` components, no absolute paths) before use. Intermediate
+   directory components that are symlinks are still followed (full fix:
+   `openat2(RESOLVE_BENEATH)`). The overlay does not follow symlinks for its
+   own state.
 
 ## 4. Secure-development checklist
 

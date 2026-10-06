@@ -30,4 +30,15 @@ int merge3(const char *base, size_t base_len,
            const char *ours, size_t ours_len,
            FILE *out);
 
+/*
+ * Apply a unified diff (the hunk section of a git/diff patch; file headers
+ * are not required) to `base`, writing the result to `out`. Hunks are
+ * matched by context with a forward/backward offset search; a hunk that
+ * cannot be matched is emitted as a git-style conflict block.
+ * Returns 0 if applied cleanly, 1 if conflicts were emitted, -1 on error.
+ */
+int apply_unified_diff(const char *base, size_t base_len,
+                       const char *patch, size_t patch_len,
+                       FILE *out);
+
 #endif /* DIFF_H */

@@ -142,6 +142,84 @@ int main(void) {
         free(b);
     }
 
+    /* --- apply_unified_diff (in-process patch replacement) --- */
+    {
+        char *b = NULL;
+        size_t l = 0;
+        FILE *f = open_memstream(&b, &l);
+        const char *p = "@@ -2 +2 @@\n-b\n+X\n";
+        rc = apply_unified_diff("a\nb\nc\n", 6, p, strlen(p), f);
+        fclose(f);
+        check(rc == 0 && strcmp(b, "a\nX\nc\n") == 0, "apply: clean modify");
+        free(b);
+    }
+    {
+        char *b = NULL;
+        size_t l = 0;
+        FILE *f = open_memstream(&b, &l);
+        const char *p = "@@ -3,0 +4 @@\n+NEW\n";
+        rc = apply_unified_diff("a\nb\n", 4, p, strlen(p), f);
+        fclose(f);
+        check(rc == 0 && strcmp(b, "a\nb\nNEW\n") == 0, "apply: insertion at EOF");
+        free(b);
+    }
+    {
+        char *b = NULL;
+        size_t l = 0;
+        FILE *f = open_memstream(&b, &l);
+        const char *p = "@@ -2 +1 @@\n-b\n";
+        rc = apply_unified_diff("a\nb\nc\n", 6, p, strlen(p), f);
+        fclose(f);
+        check(rc == 0 && strcmp(b, "a\nc\n") == 0, "apply: deletion");
+        free(b);
+    }
+    {
+        /* context mismatch at the claimed position -> offset search finds it */
+        char *b = NULL;
+        size_t l = 0;
+        FILE *f = open_memstream(&b, &l);
+        const char *p = "@@ -1 +1 @@\n-a\n+X\n";
+        rc = apply_unified_diff("x\na\nb\nc\n", 8, p, strlen(p), f);
+        fclose(f);
+        check(rc == 0 && strcmp(b, "x\nX\nb\nc\n") == 0, "apply: offset search");
+        free(b);
+    }
+    {
+        /* unmatched hunk -> conflict markers, rc 1 */
+        char *b = NULL;
+        size_t l = 0;
+        FILE *f = open_memstream(&b, &l);
+        const char *p = "@@ -9 +9 @@\n-ZZZ\n";
+        rc = apply_unified_diff("a\nb\nc\n", 6, p, strlen(p), f);
+        fclose(f);
+        check(rc == 1, "apply: unmatched hunk is conflict");
+        check(strstr(b, "<<<<<<< base") != NULL && strstr(b, ">>>>>>> patch") != NULL,
+              "apply: conflict markers");
+        free(b);
+    }
+    {
+        /* two hunks */
+        char *b = NULL;
+        size_t l = 0;
+        FILE *f = open_memstream(&b, &l);
+        const char *p = "@@ -1 +1 @@\n-a\n+A\n@@ -4 +4 @@\n-d\n+D\n";
+        rc = apply_unified_diff("a\nb\nc\nd\n", 8, p, strlen(p), f);
+        fclose(f);
+        check(rc == 0 && strcmp(b, "A\nb\nc\nD\n") == 0, "apply: multi-hunk");
+        free(b);
+    }
+    {
+        /* no trailing newline in base, "\ No newline" marker ignored */
+        char *b = NULL;
+        size_t l = 0;
+        FILE *f = open_memstream(&b, &l);
+        const char *p = "@@ -2 +2 @@\n-b\n+B\n\\ No newline at end of file\n";
+        rc = apply_unified_diff("a\nb", 3, p, strlen(p), f);
+        fclose(f);
+        check(rc == 0 && strcmp(b, "a\nB\n") == 0, "apply: no-newline base + marker");
+        free(b);
+    }
+
     printf("\n== diff engine: %d passed, %d failed ==\n", passes, failures);
     return failures ? 1 : 0;
 }

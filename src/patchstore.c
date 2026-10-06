@@ -692,41 +692,10 @@ int ps_check_conflict(ps_store *ps, ps_session *s) {
 /* conflict messages (stderr + /fuse/messages/, de-duplicated)         */
 /* ------------------------------------------------------------------ */
 
-/* run an external program with explicit argv (no shell -> no injection);
- * optionally redirect stdin/stdout from files. Returns exit status or -1. */
-static int run_prog(char *const argv[], const char *stdin_path, const char *stdout_path) {
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        if (stdin_path) {
-            int fd = open(stdin_path, O_RDONLY);
-            if (fd >= 0) {
-                dup2(fd, 0);
-                close(fd);
-            }
-        }
-        if (stdout_path) {
-            int fd = open(stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (fd >= 0) {
-                dup2(fd, 1);
-                close(fd);
-            }
-        }
-        int dn = open("/dev/null", O_WRONLY);
-        if (dn >= 0) {
-            dup2(dn, 2);
-            close(dn);
-        }
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    int st = 0;
-    waitpid(pid, &st, 0);
-    if (WIFEXITED(st)) return WEXITSTATUS(st);
-    return -1;
-}
+/* read a whole file into a buffer; missing/unreadable file -> empty (len 0).
+ * Reads are capped: oversized inputs (attacker-controlled diff bases) fail. */
+#define SLURP_MAX (64UL * 1024 * 1024)
 
-/* read a whole file into a buffer; missing/unreadable file -> empty (len 0) */
 static int slurp_file(const char *path, char **out, size_t *out_len) {
     *out = NULL;
     *out_len = 0;
@@ -740,6 +709,11 @@ static int slurp_file(const char *path, char **out, size_t *out_len) {
         if (len + (size_t)r > cap) {
             cap = cap ? cap * 2 : 65536;
             while (cap < len + (size_t)r) cap *= 2;
+            if (cap > SLURP_MAX) {
+                close(fd);
+                free(buf);
+                return -1;
+            }
             char *tmp = realloc(buf, cap);
             if (!tmp) {
                 close(fd);
@@ -1792,8 +1766,7 @@ static void print_diff_conflict(ps_store *ps, const char *relpath,
 
 /* apply one file's diff segment to its merged state, with conflict markers */
 static int apply_file_diff(ps_store *ps, const char *relpath, const char *seg) {
-    char diffp[4096], inp[4096];
-    snprintf(diffp, sizeof diffp, "%s/tmp/audit.diff", ps->store_dir);
+    char inp[4096];
     snprintf(inp, sizeof inp, "%s/tmp/audit.in", ps->store_dir);
 
     char cur[4096];
@@ -1802,23 +1775,19 @@ static int apply_file_diff(ps_store *ps, const char *relpath, const char *seg) {
     if (src == PS_SRC_LOWER)
         lower_path(ps, relpath, cur, sizeof cur);
 
-    int ifd = open(inp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (ifd < 0) return -1;
-    if (copy_path_into(cur, ifd) != 0) { close(ifd); return -1; }
-    close(ifd);
+    char *base_buf = NULL;
+    size_t base_len = 0;
+    if (slurp_file(cur, &base_buf, &base_len) != 0) return -1;
 
-    FILE *df = fopen(diffp, "w");
-    if (!df) return -1;
-    fputs(seg, df);
-    fclose(df);
-
-    char *argv[] = { "patch", "--merge", "-s", "-p1", inp, NULL };
-    int rc = run_prog(argv, diffp, NULL); /* stdin <- diffp, edits inp in place */
-    if (rc != 0 && rc != 1) {
-        char *argv0[] = { "patch", "--merge", "-s", "-p0", inp, NULL };
-        rc = run_prog(argv0, diffp, NULL);
+    FILE *of = fopen(inp, "w");
+    if (!of) {
+        free(base_buf);
+        return -1;
     }
-    if (rc != 0 && rc != 1) return -1;
+    int rc = apply_unified_diff(base_buf, base_len, seg, strlen(seg), of);
+    fclose(of);
+    free(base_buf);
+    if (rc < 0) return -1;
 
     struct stat st;
     stat(inp, &st);
@@ -1837,14 +1806,54 @@ static int apply_file_diff(ps_store *ps, const char *relpath, const char *seg) {
     return r;
 }
 
+/* Validate a path taken from an untrusted git-diff header: must be relative,
+ * non-empty, and contain no "." or ".." components (blocks path traversal
+ * via `+++ b/../../../etc/passwd`-style headers). Returns 0 / -1. */
+static int sanitize_relpath(const char *p, char *out, size_t out_sz) {
+    const char *s = p;
+    size_t o = 0;
+
+    if (*s == '/') return -1; /* absolute path */
+
+    while (*s) {
+        const char *start = s;
+        while (*s && *s != '/') s++;
+        size_t len = (size_t)(s - start);
+
+        if (len == 0) return -1; /* empty component ("//") */
+        if (len == 1 && start[0] == '.') return -1;
+        if (len == 2 && start[0] == '.' && start[1] == '.') return -1;
+
+        if (o > 0) {
+            if (o + 1 >= out_sz) return -1;
+            out[o++] = '/';
+        }
+        if (o + len >= out_sz) return -1;
+        memcpy(out + o, start, len);
+        o += len;
+        if (*s == '/') s++;
+    }
+
+    if (o == 0) return -1; /* empty path */
+    out[o] = '\0';
+    return 0;
+}
+
 int ps_apply_gitdiff(ps_store *ps, const char *diff_text) {
     struct diff_seg *segs = NULL;
     int n = split_diff(diff_text, &segs);
     if (n < 0) return 0; /* OOM during splitting */
     int applied = 0;
     for (int i = 0; i < n; i++) {
-        char relpath[4096];
-        snprintf(relpath, sizeof relpath, "/%s", segs[i].path);
+        char clean[4096], relpath[4096];
+        if (sanitize_relpath(segs[i].path, clean, sizeof clean) != 0) {
+            fprintf(stderr, "[overlay] audit: rejecting unsafe diff path '%s'\n",
+                    segs[i].path);
+            free(segs[i].path);
+            free(segs[i].text);
+            continue;
+        }
+        snprintf(relpath, sizeof relpath, "/%s", clean);
         int rc = apply_file_diff(ps, relpath, segs[i].text);
         if (rc == 0) applied++;
         else if (rc == -2) fprintf(stderr, "[overlay] patch conflict on %s (see above + messages/)\n", relpath);

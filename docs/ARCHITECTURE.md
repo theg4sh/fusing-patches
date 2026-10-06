@@ -182,14 +182,19 @@ $ ldd build/overlayfs-static
 
 ## 10.1 In-process diff engine & fast search
 
-- `src/diff.c` implements the unified-diff producer (`diff_unified`, Myers
-  O(ND) with linear backtracking) and a git-style 3-way merge with conflict
-  markers (`merge3`), replacing `diff -u` and `diff3 -m`. Diff inputs larger
-  than 2048 total lines fall back to a coarse replace-all edit script.
+- `src/diff.c` implements everything in-process: the unified-diff producer
+  (`diff_unified`, Myers O(ND) with linear backtracking), a git-style 3-way
+  merge with conflict markers (`merge3`), and the unified-diff **applier**
+  (`apply_unified_diff`: hunk parsing, context matching with a
+  forward/backward offset search, conflict markers on unmatched hunks).
+  **No external tools, no fork** — the daemon is fully self-contained.
+  Diff inputs larger than 2048 total lines fall back to a coarse replace-all
+  edit script; audit diffs are capped at 16 MiB, diff bases at 64 MiB.
 - Fast path lookups use a vendored hash table (`src/ht.h`, tsoding/ht.h,
-  MIT/Public Domain): active sessions are indexed by relpath
-  (`ps->sessions_ht`, O(1) `ps_active_size`) and apply-to-origin path dedup is
-  O(1) via a murmur3-hashed string set.
+  MIT/Public Domain, patched for OOM safety — see `patches/ht.h.patch`):
+  active sessions are indexed by relpath (`ps->sessions_ht`, O(1)
+  `ps_active_size`) and apply-to-origin path dedup is O(1) via a
+  murmur3-hashed string set.
 - Path keys are hashed with murmur3 32-bit (public domain, byte-wise,
   alignment-safe implementation in `src/patchstore.c`).
 

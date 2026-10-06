@@ -482,3 +482,194 @@ int merge3(const char *base, size_t base_len,
     free(so);
     return conflicts;
 }
+
+/* ------------------------------------------------------------------ */
+/* unified diff application (in-process `patch` replacement)           */
+/* ------------------------------------------------------------------ */
+
+/* parse "@@ -a[,b] +c[,d] @@" — returns 0 on success */
+static int parse_hunk_header(const char *line, long *a, long *b, long *c, long *d) {
+    const char *p = line;
+    char *end;
+    if (strncmp(p, "@@ -", 4) != 0) return -1;
+    p += 4;
+    *a = strtol(p, &end, 10);
+    if (end == p) return -1;
+    p = end;
+    *b = 1;
+    if (*p == ',') {
+        p++;
+        *b = strtol(p, &end, 10);
+        if (end == p) return -1;
+        p = end;
+    }
+    while (*p == ' ') p++;
+    if (*p != '+') return -1;
+    p++;
+    *c = strtol(p, &end, 10);
+    if (end == p) return -1;
+    p = end;
+    *d = 1;
+    if (*p == ',') {
+        p++;
+        *d = strtol(p, &end, 10);
+        if (end == p) return -1;
+        p = end;
+    }
+    (void)b;
+    (void)d;
+    return 0;
+}
+
+/* compare a patch line against a base line, ignoring trailing-newline/CR */
+static int patch_line_match(const struct slice *base, const char *pl, size_t plen) {
+    size_t blen = base->len;
+    if (blen && base->ptr[blen - 1] == '\n') blen--;
+    if (blen && base->ptr[blen - 1] == '\r') blen--;
+    if (plen && pl[plen - 1] == '\n') plen--;
+    if (plen && pl[plen - 1] == '\r') plen--;
+    return blen == plen && memcmp(base->ptr, pl, blen) == 0;
+}
+
+struct hunk_line {
+    char kind;       /* ' ', '-', '+' */
+    struct slice s;  /* content WITHOUT the leading kind char */
+};
+
+static int hunk_append(struct hunk_line **h, int *n, int *cap, char kind, struct slice s) {
+    if (*n == *cap) {
+        size_t ncap = *cap ? (size_t)*cap * 2 : 64;
+        struct hunk_line *tmp = realloc(*h, ncap * sizeof *tmp);
+        if (!tmp) return -1;
+        *h = tmp;
+        *cap = (int)ncap;
+    }
+    (*h)[*n].kind = kind;
+    (*h)[*n].s = s;
+    (*n)++;
+    return 0;
+}
+
+/* emit a patch line's content as a result line (always newline-terminated) */
+static void emit_patch_line(FILE *out, const struct slice *s) {
+    fwrite(s->ptr, 1, s->len, out);
+    if (s->len == 0 || s->ptr[s->len - 1] != '\n')
+        fputc('\n', out);
+}
+
+int apply_unified_diff(const char *base, size_t base_len,
+                       const char *patch, size_t patch_len,
+                       FILE *out) {
+    struct slice *bl = NULL;
+    int bn = split_lines(base, base_len, &bl);
+    if (bn < 0) return -1;
+
+    struct slice *pl = NULL;
+    int pn = split_lines(patch, patch_len, &pl);
+    if (pn < 0) {
+        free(bl);
+        return -1;
+    }
+
+    int conflicts = 0;
+    long base_pos = 0; /* next unchanged base line to emit */
+    long delta = 0;    /* applied line-count offset (inserts - deletes) */
+
+    for (int i = 0; i < pn;) {
+        long ha, hb, hc, hd;
+        if (pl[i].len < 4 || strncmp(pl[i].ptr, "@@ -", 4) != 0 ||
+            parse_hunk_header(pl[i].ptr, &ha, &hb, &hc, &hd) != 0) {
+            i++;
+            continue;
+        }
+        i++;
+
+        /* collect the hunk body */
+        struct hunk_line *body = NULL;
+        int nbody = 0, capbody = 0;
+        int n_before = 0, n_plus = 0, n_minus = 0;
+        while (i < pn) {
+            struct slice *s = &pl[i];
+            if (s->len == 0) break;
+            char k = s->ptr[0];
+            if (k != ' ' && k != '-' && k != '+') break; /* next hunk / junk */
+            struct slice cs = { s->ptr + 1, s->len - 1 };
+            if (hunk_append(&body, &nbody, &capbody, k, cs) != 0) {
+                free(body);
+                free(pl);
+                free(bl);
+                return -1;
+            }
+            if (k == '+') n_plus++;
+            else {
+                n_before++;
+                if (k == '-') n_minus++;
+            }
+            i++;
+        }
+
+        /* find the position where the before-side matches */
+        long expected = (ha - 1) + delta;
+        if (expected < 0) expected = 0;
+        if (expected > bn) expected = bn;
+
+        long pos = -1;
+        for (long off = 0; pos < 0 && off <= bn; off++) {
+            long cands[2] = { expected + off, expected - off };
+            for (int t = 0; t < 2 && pos < 0; t++) {
+                long cand = cands[t];
+                if (cand < 0 || cand + n_before > bn) continue;
+                int ok = 1;
+                int j = 0;
+                for (int k = 0; k < nbody && ok; k++) {
+                    if (body[k].kind == '+') continue;
+                    if (!patch_line_match(&bl[cand + j], body[k].s.ptr, body[k].s.len))
+                        ok = 0;
+                    j++;
+                }
+                if (ok) pos = cand;
+            }
+        }
+
+        if (pos >= 0) {
+            /* emit unchanged lines before the hunk */
+            long from = base_pos > pos ? pos : base_pos;
+            for (long k = from; k < pos && k < bn; k++)
+                emit_raw(out, &bl[k]);
+
+            /* apply: context lines from base, insertions from the patch */
+            int j = 0;
+            for (int k = 0; k < nbody; k++) {
+                if (body[k].kind == ' ') {
+                    if (pos + j < bn) emit_raw(out, &bl[pos + j]);
+                    j++;
+                } else if (body[k].kind == '-') {
+                    j++;
+                } else {
+                    emit_patch_line(out, &body[k].s);
+                }
+            }
+            delta += n_plus - n_minus;
+            base_pos = pos + n_before;
+        } else {
+            /* unmatched hunk -> conflict block */
+            conflicts = 1;
+            fprintf(out, "<<<<<<< base\n");
+            for (int k = 0; k < nbody; k++)
+                if (body[k].kind != '+') emit_patch_line(out, &body[k].s);
+            fprintf(out, "=======\n");
+            for (int k = 0; k < nbody; k++)
+                if (body[k].kind != '-') emit_patch_line(out, &body[k].s);
+            fprintf(out, ">>>>>>> patch\n");
+        }
+
+        free(body);
+    }
+
+    for (long k = base_pos; k < bn; k++)
+        emit_raw(out, &bl[k]);
+
+    free(pl);
+    free(bl);
+    return conflicts;
+}

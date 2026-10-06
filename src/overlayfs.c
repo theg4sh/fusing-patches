@@ -420,19 +420,25 @@ static int ov_release(const char *path, struct fuse_file_info *fi) {
     if (!h) return 0;
 
     if (h->audit) {
-        /* accumulated git-diff -> apply it now */
+        /* accumulated git-diff -> apply it now. Cap the size: an attacker
+         * can pwrite at a huge offset (sparse file) to make st_size explode */
         struct stat st;
         if (fstat(h->fd, &st) == 0 && st.st_size > 0) {
-            char *buf = malloc((size_t)st.st_size + 1);
-            if (buf) {
-                lseek(h->fd, 0, SEEK_SET);
-                ssize_t r = read(h->fd, buf, (size_t)st.st_size);
-                if (r > 0) {
-                    buf[r] = '\0';
-                    int applied = ps_apply_gitdiff(OVERLAY_DATA->ps, buf);
-                    fprintf(stderr, "[overlay] audit: %d file(s) updated\n", applied);
+            if (st.st_size > 16 * 1024 * 1024) {
+                fprintf(stderr, "[overlay] audit: diff too large (%lld bytes), rejected\n",
+                        (long long)st.st_size);
+            } else {
+                char *buf = malloc((size_t)st.st_size + 1);
+                if (buf) {
+                    lseek(h->fd, 0, SEEK_SET);
+                    ssize_t r = read(h->fd, buf, (size_t)st.st_size);
+                    if (r > 0) {
+                        buf[r] = '\0';
+                        int applied = ps_apply_gitdiff(OVERLAY_DATA->ps, buf);
+                        fprintf(stderr, "[overlay] audit: %d file(s) updated\n", applied);
+                    }
+                    free(buf);
                 }
-                free(buf);
             }
         }
         close(h->fd);
