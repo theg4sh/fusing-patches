@@ -4,7 +4,7 @@
 
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BIN="${BIN:-$HERE/build/overlayfs}"
+BIN="${BIN:-$HERE/build/fusing-patches}"
 
 LOWER=$(mktemp -d /tmp/ol.XXXXXX)
 STORE=$(mktemp -d /tmp/os.XXXXXX)

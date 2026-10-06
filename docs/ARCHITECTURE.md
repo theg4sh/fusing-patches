@@ -153,8 +153,8 @@ The auditor mounts `--patch-view` and can, before the final unmount:
 fully static binary with no runtime dynamic dependencies:
 
 ```
-make static   # -> build/overlayfs-static
-$ ldd build/overlayfs-static
+make static   # -> build/fusing-patches-static
+$ ldd build/fusing-patches-static
         not a dynamic executable
 ```
 
@@ -227,13 +227,13 @@ Remaining known limitations (documented, not fixed):
 ## 12. Usage
 
 ```bash
-make                       # dynamic dev build -> build/overlayfs
-make static                # static build       -> build/overlayfs-static
+make                       # dynamic dev build -> build/fusing-patches
+make static                # static build       -> build/fusing-patches-static
 
-./build/overlayfs <lower> <store> <mnt> --name=alice -f      # writer
-./build/overlayfs <lower> <store> <mnt> --name=bob   -f      # another writer
-./build/overlayfs <lower> <store> <mnt> --merge      -f      # merged view
-./build/overlayfs <lower> <store> <mnt> --patch-view -f      # auditor view
+./build/fusing-patches <lower> <store> <mnt> --name=alice -f      # writer
+./build/fusing-patches <lower> <store> <mnt> --name=bob   -f      # another writer
+./build/fusing-patches <lower> <store> <mnt> --merge      -f      # merged view
+./build/fusing-patches <lower> <store> <mnt> --patch-view -f      # auditor view
 
 # virtual namespace inside a mount:
 #   /fuse/merge/<path>      write agreed content (resolution)

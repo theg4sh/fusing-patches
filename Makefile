@@ -5,7 +5,7 @@ PKG_LIBS   = $(shell pkg-config --libs fuse3)
 
 SRC = src/overlayfs.c src/patchstore.c src/diff.c
 OBJ = $(SRC:src/%.c=build/%.o)
-BIN = build/overlayfs
+BIN = build/fusing-patches
 STRESS = build/stress
 DIFFTEST = build/difftest
 
@@ -58,9 +58,9 @@ static: $(FUSE_LIB) $(SRC) src/patchstore.h src/diff.h
 	$(CC) -O2 -DFUSE_USE_VERSION=31 $(FUSE_CFLAGS) -c src/overlayfs.c -o build/overlayfs_s.o
 	$(CC) -O2 -DFUSE_USE_VERSION=31 $(FUSE_CFLAGS) -c src/patchstore.c -o build/patchstore_s.o
 	$(CC) -O2 -DFUSE_USE_VERSION=31 $(FUSE_CFLAGS) -c src/diff.c -o build/diff_s.o
-	$(CC) -static build/overlayfs_s.o build/patchstore_s.o build/diff_s.o $(FUSE_LIB) -lpthread -lrt -ldl -o build/overlayfs-static
-	strip build/overlayfs-static
-	@echo ">>> built: build/overlayfs-static"
+	$(CC) -static build/overlayfs_s.o build/patchstore_s.o build/diff_s.o $(FUSE_LIB) -lpthread -lrt -ldl -o build/fusing-patches-static
+	strip build/fusing-patches-static
+	@echo ">>> built: build/fusing-patches-static"
 
 clean:
 	rm -rf build

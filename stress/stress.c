@@ -2,7 +2,7 @@
  * multiple pthreads per mount, verifies, unmounts). Replaces the shell stress
  * scripts; run via `make stress-test` / `make stress-long`.
  *
- * usage: stress <overlayfs-binary> [options]
+ * usage: stress <fusing-patches binary> [options]
  *   --duration=SECS   sustained mode (default: burst)
  *   --agents=A        overlay mountpoints to drive   (default 4)
  *   --threads=T       worker threads per agent       (default 2)
@@ -196,7 +196,7 @@ static void rmtree(const char *path) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "usage: stress <overlayfs-binary> [options]\n");
+        fprintf(stderr, "usage: stress <fusing-patches binary> [options]\n");
         return 2;
     }
     snprintf(overlay_bin, sizeof overlay_bin, "%s", argv[1]);
