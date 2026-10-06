@@ -18,6 +18,7 @@ MOUNTS=()
 
 cleanup() {
     for m in "${MOUNTS[@]}"; do fusermount3 -u "$m" 2>/dev/null || fusermount -u "$m" 2>/dev/null || true; done
+    for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null; done
     rm -rf "$LOWER" "$STORE" "${MOUNTS[@]}"
 }
 trap cleanup EXIT

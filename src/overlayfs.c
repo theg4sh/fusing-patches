@@ -17,8 +17,10 @@
 struct overlay {
     ps_store *ps;
     char *lower_dir;
-    int merge_view; /* read-only view of the agreed merged result */
+    ps_kind kind; /* writer / merge / patchview */
 };
+
+#define ov_readonly(ov) ((ov)->kind == PS_KIND_MERGE)
 
 /* per-open file handle */
 struct fh {
@@ -26,6 +28,8 @@ struct fh {
     int fd;           /* lower/blob/merge/message fd (read) or session temp fd (write) */
     int write;
     int conflicted;   /* set by flush when the write was soft-blocked */
+    int audit;        /* this handle accumulates a git-diff to apply */
+    char *audit_tmp;  /* temp file holding the accumulated diff */
     char *relpath;
 };
 
@@ -37,7 +41,7 @@ static void lower_path_of(struct overlay *ov, const char *relpath, char *out, si
 
 /* ---- virtual /fuse namespace ---- */
 
-enum vkind { V_NONE = 0, V_FUSE, V_MERGE_DIR, V_MSG_DIR, V_MERGE_FILE, V_MSG_FILE };
+enum vkind { V_NONE = 0, V_FUSE, V_MERGE_DIR, V_MSG_DIR, V_MERGE_FILE, V_MSG_FILE, V_AUDIT_DIR, V_AUDIT_FILE };
 
 static enum vkind classify(const char *path, char *rest, size_t rest_sz) {
     if (strcmp(path, "/fuse") == 0) return V_FUSE;
@@ -53,6 +57,13 @@ static enum vkind classify(const char *path, char *rest, size_t rest_sz) {
         if (path[14] == '/') {
             snprintf(rest, rest_sz, "%s", path + 15);
             return V_MSG_FILE;
+        }
+    }
+    if (strncmp(path, "/fuse/audit", 11) == 0) {
+        if (path[11] == '\0') return V_AUDIT_DIR;
+        if (path[11] == '/') {
+            snprintf(rest, rest_sz, "%s", path + 12);
+            return V_AUDIT_FILE;
         }
     }
     return V_NONE;
@@ -73,7 +84,13 @@ static int ov_getattr(const char *path, struct stat *st, struct fuse_file_info *
     case V_FUSE:
     case V_MERGE_DIR:
     case V_MSG_DIR:
+    case V_AUDIT_DIR:
         dir_stat(st);
+        return 0;
+    case V_AUDIT_FILE:
+        memset(st, 0, sizeof *st);
+        st->st_mode = S_IFREG | 0644;
+        st->st_nlink = 1;
         return 0;
     case V_MERGE_FILE: {
         char relpath[4096];
@@ -174,12 +191,15 @@ static int ov_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     case V_FUSE:
         list_dir_add_cb(&fc, "merge");
         list_dir_add_cb(&fc, "messages");
+        list_dir_add_cb(&fc, "audit");
         return 0;
     case V_MERGE_DIR:
         ps_list_merge(ov->ps, "/", list_add_cb, &fc);
         return 0;
     case V_MSG_DIR:
         ps_list_messages(ov->ps, list_add_cb, &fc);
+        return 0;
+    case V_AUDIT_DIR:
         return 0;
     default:
         break;
@@ -223,13 +243,34 @@ static int ov_open(const char *path, struct fuse_file_info *fi) {
     if (is_write && kind == V_MSG_FILE)
         return -EACCES;
 
-    if (ov->merge_view && is_write)
+    if (ov_readonly(ov) && is_write)
         return -EROFS;
 
     struct fh *h = calloc(1, sizeof *h);
     if (!h) return -ENOMEM;
     h->fd = -1;
     h->relpath = strdup(path);
+
+    if (kind == V_AUDIT_FILE) {
+        /* a git-diff written here is applied on close */
+        if (!is_write) {
+            free(h->relpath);
+            free(h);
+            return -ENOENT;
+        }
+        char tpl[] = "/tmp/overlay-audit-XXXXXX";
+        h->fd = mkstemp(tpl);
+        if (h->fd < 0) {
+            free(h->relpath);
+            free(h);
+            return -errno;
+        }
+        h->audit_tmp = strdup(tpl);
+        h->audit = 1;
+        h->write = 1;
+        fi->fh = (uint64_t)(uintptr_t)h;
+        return 0;
+    }
 
     if (kind == V_MSG_FILE) {
         char mp[4096];
@@ -305,7 +346,10 @@ static int ov_open(const char *path, struct fuse_file_info *fi) {
 
     if (is_write) {
         h->write = 1;
-        h->sess = ps_begin(ov->ps, path, exists);
+        if (ov->kind == PS_KIND_PATCHVIEW)
+            h->sess = ps_begin_merge_seeded(ov->ps, path);
+        else
+            h->sess = ps_begin(ov->ps, path, exists);
         if (!h->sess) {
             free(h->relpath);
             free(h);
@@ -348,6 +392,11 @@ static int ov_write(const char *path, const char *buf, size_t size, off_t off,
                     struct fuse_file_info *fi) {
     (void)path;
     struct fh *h = (struct fh *)(uintptr_t)fi->fh;
+    if (h->audit) {
+        ssize_t w = pwrite(h->fd, buf, size, off);
+        if (w < 0) return -errno;
+        return (int)w;
+    }
     if (!h->write) return -EBADF;
     ssize_t w = ps_write(OVERLAY_DATA->ps, h->sess, buf, size, off);
     if (w < 0) return (int)w;
@@ -358,6 +407,33 @@ static int ov_release(const char *path, struct fuse_file_info *fi) {
     (void)path;
     struct fh *h = (struct fh *)(uintptr_t)fi->fh;
     if (!h) return 0;
+
+    if (h->audit) {
+        /* accumulated git-diff -> apply it now */
+        struct stat st;
+        if (fstat(h->fd, &st) == 0 && st.st_size > 0) {
+            char *buf = malloc((size_t)st.st_size + 1);
+            if (buf) {
+                lseek(h->fd, 0, SEEK_SET);
+                ssize_t r = read(h->fd, buf, (size_t)st.st_size);
+                if (r > 0) {
+                    buf[r] = '\0';
+                    int applied = ps_apply_gitdiff(OVERLAY_DATA->ps, buf);
+                    fprintf(stderr, "[overlay] audit: %d file(s) updated\n", applied);
+                }
+                free(buf);
+            }
+        }
+        close(h->fd);
+        if (h->audit_tmp) {
+            unlink(h->audit_tmp);
+            free(h->audit_tmp);
+        }
+        free(h->relpath);
+        free(h);
+        return 0;
+    }
+
     if (h->write) {
         if (h->sess) {
             if (h->conflicted) {
@@ -403,18 +479,36 @@ static int ov_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     char rest[4096];
     enum vkind kind = classify(path, rest, sizeof rest);
 
-    if (ov->merge_view)
+    if (ov_readonly(ov))
         return -EROFS;
 
     struct fh *h = calloc(1, sizeof *h);
     if (!h) return -ENOMEM;
     h->write = 1;
+    h->fd = -1;
     h->relpath = strdup(path);
+
+    if (kind == V_AUDIT_FILE) {
+        char tpl[] = "/tmp/overlay-audit-XXXXXX";
+        h->fd = mkstemp(tpl);
+        if (h->fd < 0) {
+            free(h->relpath);
+            free(h);
+            return -errno;
+        }
+        h->audit_tmp = strdup(tpl);
+        h->audit = 1;
+        fi->fh = (uint64_t)(uintptr_t)h;
+        fi->direct_io = 1;
+        return 0;
+    }
 
     if (kind == V_MERGE_FILE) {
         char relpath[4096];
         snprintf(relpath, sizeof relpath, "/%s", rest);
         h->sess = ps_begin_merge(ov->ps, relpath);
+    } else if (ov->kind == PS_KIND_PATCHVIEW) {
+        h->sess = ps_begin_merge_seeded(ov->ps, path);
     } else {
         h->sess = ps_begin(ov->ps, path, 0 /* new file */);
     }
@@ -484,10 +578,31 @@ static int ov_statfs(const char *path, struct statvfs *st) {
     return -errno;
 }
 
+/* remove (reject) a file's patches -> it reverts to origin content */
+static int ov_unlink(const char *path) {
+    struct overlay *ov = OVERLAY_DATA;
+    if (ov_readonly(ov)) return -EROFS;
+    char rest[4096];
+    if (classify(path, rest, sizeof rest) != V_NONE) return -EACCES;
+    ps_reject(ov->ps, path);
+    return 0;
+}
+
 static void *ov_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     (void)conn;
     cfg->use_ino = 0;
-    return OVERLAY_DATA;
+    struct overlay *ov = OVERLAY_DATA;
+    ps_mount_register(ov->ps, ov->kind);
+    return ov;
+}
+
+static void ov_destroy(void *priv) {
+    struct overlay *ov = priv;
+    if (!ov) return;
+    if (ps_mount_unregister(ov->ps, ov->kind)) {
+        int n = ps_apply_to_origin(ov->ps);
+        fprintf(stderr, "[overlay] last non-merge mount gone: %d file(s) applied to origin\n", n);
+    }
 }
 
 static struct fuse_operations ops = {
@@ -500,20 +615,24 @@ static struct fuse_operations ops = {
     .flush    = ov_flush,
     .create   = ov_create,
     .truncate = ov_truncate,
+    .unlink   = ov_unlink,
     .access   = ov_access,
     .statfs   = ov_statfs,
     .init     = ov_init,
+    .destroy  = ov_destroy,
 };
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s <lower> <store> <mountpoint> [--name=ID] [--merge] [fuse options]\n"
+            "usage: %s <lower> <store> <mountpoint> [--name=ID] [--merge|--patch-view] [fuse options]\n"
             "\n"
             "  lower        read-only source filesystem (a directory; may itself be a FUSE mount)\n"
             "  store        sidecar directory shared by all mountpoints\n"
             "  mountpoint   where this view is mounted\n"
             "  --name=ID    mountpoint identity (agent name); default 'agent'\n"
-            "  --merge      mount a read-only view of the agreed merged result\n", prog);
+            "  --merge      read-only view of the agreed merged result\n"
+            "  --patch-view auditor's view: writable (edits update merged state), rm = reject,\n"
+            "               /fuse/audit/<n>.patch applies a (multi-file) git-diff\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -527,7 +646,7 @@ int main(int argc, char *argv[]) {
     const char *mount = argv[3];
 
     const char *name = "agent";
-    int merge_view = 0;
+    ps_kind kind = PS_KIND_WRITER;
 
     /* pull our custom flags out of argv, keep the rest for libfuse */
     int nout = 0;
@@ -538,7 +657,9 @@ int main(int argc, char *argv[]) {
         if (strncmp(argv[i], "--name=", 7) == 0) {
             name = argv[i] + 7;
         } else if (strcmp(argv[i], "--merge") == 0) {
-            merge_view = 1;
+            kind = PS_KIND_MERGE;
+        } else if (strcmp(argv[i], "--patch-view") == 0) {
+            kind = PS_KIND_PATCHVIEW;
         } else {
             new_argv[nout++] = argv[i];
         }
@@ -551,9 +672,9 @@ int main(int argc, char *argv[]) {
         free(new_argv);
         return 1;
     }
-    ps_set_owner(ps, merge_view ? "merge" : name);
+    ps_set_owner(ps, kind == PS_KIND_WRITER ? name : kind == PS_KIND_MERGE ? "merge" : "patchview");
 
-    struct overlay ov = { .ps = ps, .lower_dir = (char *)lower, .merge_view = merge_view };
+    struct overlay ov = { .ps = ps, .lower_dir = (char *)lower, .kind = kind };
 
     int rc = fuse_main(nout, new_argv, &ops, &ov);
 

@@ -47,6 +47,8 @@ void ps_set_owner(ps_store *ps, const char *owner);
 ps_session *ps_begin(ps_store *ps, const char *relpath, int exists);
 /* Begin a merge session (write under /fuse/merge/<relpath>). */
 ps_session *ps_begin_merge(ps_store *ps, const char *relpath);
+/* Begin a merge session seeded from current content (patch-view edits). */
+ps_session *ps_begin_merge_seeded(ps_store *ps, const char *relpath);
 
 ssize_t ps_write(ps_store *ps, ps_session *s, const char *buf, size_t size, off_t off);
 ssize_t ps_read(ps_store *ps, ps_session *s, char *buf, size_t size, off_t off);
@@ -98,5 +100,34 @@ void ps_list_merge(ps_store *ps, const char *dir, ps_list_cb cb, void *ctx);
 void ps_list_messages(ps_store *ps, ps_list_cb cb, void *ctx);
 /* Full path of a message file given its basename. Returns 0/-1. */
 int ps_message_path(ps_store *ps, const char *name, char *out, size_t out_sz);
+
+/* ------------------------------------------------------------------ */
+/* multi-level mounts, patch-view + apply-to-origin                     */
+/* ------------------------------------------------------------------ */
+
+/* Kind of a mountpoint. */
+typedef enum {
+    PS_KIND_WRITER = 0, /* editing mount (default) */
+    PS_KIND_MERGE = 1,  /* read-only merged-result view */
+    PS_KIND_PATCHVIEW = 2, /* auditor's view: writable, removable */
+} ps_kind;
+
+/* Register this mountpoint in the store's active-mount registry. */
+void ps_mount_register(ps_store *ps, ps_kind kind);
+/* Unregister; returns 1 when no non-merge mount remains (apply time). */
+int ps_mount_unregister(ps_store *ps, ps_kind kind);
+
+/* Materialize every un-rejected patch/merge into the origin (lower) fs.
+ * Returns the number of files written, or -1 on error. */
+int ps_apply_to_origin(ps_store *ps);
+
+/* Reject `relpath`: clear all patch/merge state so it reverts to origin. */
+int ps_reject(ps_store *ps, const char *relpath);
+
+/* Apply a (possibly multi-file) unified/git diff. Each file's hunks are split
+ * by path and applied to that file's merged state using the normal conflict
+ * rules. On conflict the real 3-way diff-conflict (with markers) is printed to
+ * stderr and stored under messages/. Returns 0 on success, -1 on error. */
+int ps_apply_gitdiff(ps_store *ps, const char *diff_text);
 
 #endif /* PATCHSTORE_H */

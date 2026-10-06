@@ -14,6 +14,7 @@ MM=$(mktemp -d /tmp/mm.XXXXXX)
 
 cleanup() {
     for m in "$MA" "$MB" "$MM"; do fusermount3 -u "$m" 2>/dev/null || fusermount -u "$m" 2>/dev/null || true; done
+    wait $PA $PB $PM 2>/dev/null || true
     rm -rf "$LOWER" "$STORE" "$MA" "$MB" "$MM"
 }
 trap cleanup EXIT

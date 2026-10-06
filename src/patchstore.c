@@ -1,5 +1,6 @@
 #include "patchstore.h"
 
+#define _GNU_SOURCE 1
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -502,6 +503,11 @@ ps_session *ps_begin(ps_store *ps, const char *relpath, int exists) {
 ps_session *ps_begin_merge(ps_store *ps, const char *relpath) {
     /* a merge write carries the full agreed content, so it starts empty */
     return begin_common(ps, relpath, 0, 1);
+}
+
+ps_session *ps_begin_merge_seeded(ps_store *ps, const char *relpath) {
+    /* patch-view edit: seed from current content, commit to the merged snapshot */
+    return begin_common(ps, relpath, 1, 1);
 }
 
 ssize_t ps_write(ps_store *ps, ps_session *s, const char *buf, size_t size, off_t off) {
@@ -1087,4 +1093,355 @@ void ps_list_messages(ps_store *ps, ps_list_cb cb, void *ctx) {
 int ps_message_path(ps_store *ps, const char *name, char *out, size_t out_sz) {
     snprintf(out, out_sz, "%s/messages/%s/%s", ps->store_dir, ps->owner, name);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* mount registry + apply-to-origin + patch-view                       */
+/* ------------------------------------------------------------------ */
+
+static const char *kind_name(ps_kind k) {
+    switch (k) {
+    case PS_KIND_WRITER: return "writer";
+    case PS_KIND_MERGE: return "merge";
+    case PS_KIND_PATCHVIEW: return "patchview";
+    }
+    return "unknown";
+}
+
+void ps_mount_register(ps_store *ps, ps_kind kind) {
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s/mounts/active", ps->store_dir);
+    ensure_dir(dir);
+    char f[4096];
+    snprintf(f, sizeof f, "%s/%s.%s.%ld", dir, kind_name(kind), ps->owner, (long)getpid());
+    int fd = open(f, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) close(fd);
+}
+
+int ps_mount_unregister(ps_store *ps, ps_kind kind) {
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s/mounts/active", ps->store_dir);
+    char f[4096];
+    snprintf(f, sizeof f, "%s/%s.%s.%ld", dir, kind_name(kind), ps->owner, (long)getpid());
+    unlink(f);
+
+    DIR *d = opendir(dir);
+    if (!d) return 1;
+    int nonmerge = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        /* merge views do not hold the apply back */
+        if (strncmp(e->d_name, "merge.", 6) != 0) nonmerge = 1;
+    }
+    closedir(d);
+    return !nonmerge;
+}
+
+/* recursive mkdir -p for a full path's parent directory */
+static void ensure_parent_dirs(const char *path) {
+    char buf[4096];
+    snprintf(buf, sizeof buf, "%s", path);
+    char *p = buf + 1; /* skip leading '/' */
+    for (; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            ensure_dir(buf);
+            *p = '/';
+        }
+    }
+}
+
+static int copy_file_to_path(const char *src, const char *dst) {
+    ensure_parent_dirs(dst);
+    int fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    int rc = copy_path_into(src, fd);
+    close(fd);
+    return rc;
+}
+
+static void collect_path(char ***arr, int *n, int *cap, const char *rel) {
+    for (int i = 0; i < *n; i++)
+        if (strcmp((*arr)[i], rel) == 0) return;
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *arr = realloc(*arr, sizeof(**arr) * *cap);
+    }
+    (*arr)[*n] = strdup(rel);
+    (*n)++;
+}
+
+int ps_apply_to_origin(ps_store *ps) {
+    char **paths = NULL;
+    int n = 0, cap = 0;
+
+    /* collect modified paths from patch index + merge index */
+    char mdir[4096];
+    snprintf(mdir, sizeof mdir, "%s/meta", ps->store_dir);
+    DIR *d = opendir(mdir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            char rel[4096];
+            decode_path(e->d_name, rel, sizeof rel);
+            collect_path(&paths, &n, &cap, rel);
+        }
+        closedir(d);
+    }
+    char mg[4096];
+    snprintf(mg, sizeof mg, "%s/merge", ps->store_dir);
+    d = opendir(mg);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            size_t len = strlen(e->d_name);
+            if (len < 5 || strcmp(e->d_name + len - 5, ".meta") != 0) continue;
+            char base[4096];
+            snprintf(base, sizeof base, "%.*s", (int)(len - 5), e->d_name);
+            char rel[4096];
+            decode_path(base, rel, sizeof rel);
+            collect_path(&paths, &n, &cap, rel);
+        }
+        closedir(d);
+    }
+
+    int applied = 0;
+    for (int i = 0; i < n; i++) {
+        char blob[4096];
+        int64_t seq;
+        ps_src src = ps_resolve(ps, paths[i], blob, sizeof blob, &seq);
+        if (src == PS_SRC_LOWER) continue; /* rejected or untouched */
+        char lp[4096];
+        lower_path(ps, paths[i], lp, sizeof lp);
+        if (copy_file_to_path(blob, lp) == 0) applied++;
+    }
+    for (int i = 0; i < n; i++) free(paths[i]);
+    free(paths);
+    return applied;
+}
+
+int ps_reject(ps_store *ps, const char *relpath) {
+    char mp[4096];
+    meta_path(ps, relpath, mp, sizeof mp);
+    unlink(mp);
+    char mb[4096];
+    merge_blob_path(ps, relpath, mb, sizeof mb);
+    unlink(mb);
+    char mm[4096];
+    merge_meta_path(ps, relpath, mm, sizeof mm);
+    unlink(mm);
+    return 0;
+}
+
+static int copy_fd_to_fd(int src, int dst) {
+    char buf[65536];
+    ssize_t n;
+    lseek(src, 0, SEEK_SET);
+    while ((n = read(src, buf, sizeof buf)) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(dst, buf + off, (size_t)(n - off));
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            off += w;
+        }
+    }
+    return 0;
+}
+
+/* write a file descriptor's content as the merge snapshot for relpath */
+static int merge_put_fd(ps_store *ps, const char *relpath, int content_fd, off_t size) {
+    int64_t seq = next_seq(ps);
+    if (seq < 0) return -1;
+    char mb[4096];
+    merge_blob_path(ps, relpath, mb, sizeof mb);
+    int fd = open(mb, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    if (copy_fd_to_fd(content_fd, fd) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    char mm[4096];
+    merge_meta_path(ps, relpath, mm, sizeof mm);
+    FILE *f = fopen(mm, "w");
+    if (f) {
+        fprintf(f, "M %lld %lld %s\n", (long long)seq, (long long)size, ps->owner);
+        fclose(f);
+    }
+    owner_write_seq(ps, ps->owner, seq);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* git-diff splitting + conflict-marked application                    */
+/* ------------------------------------------------------------------ */
+
+struct diff_seg {
+    char *path;
+    char *text;
+};
+
+static void strip_nl(char *s) {
+    size_t l = strlen(s);
+    while (l > 0 && (s[l - 1] == '\n' || s[l - 1] == '\r')) s[--l] = '\0';
+}
+
+/* split a (possibly multi-file) git/unified diff into per-file segments */
+static int split_diff(const char *diff, struct diff_seg **out) {
+    FILE *f = fmemopen((void *)diff, strlen(diff), "r");
+    if (!f) return 0;
+
+    char *line = NULL;
+    size_t cap = 0;
+    struct diff_seg *segs = NULL;
+    int n = 0, c = 0;
+    char *cur_path = NULL;
+    char *cur_text = NULL;
+    size_t cur_len = 0;
+
+    while (getline(&line, &cap, f) != -1) {
+        int new_seg = 0;
+        char newpath[4096] = "";
+
+        if (strncmp(line, "diff --git ", 11) == 0) {
+            char *b = strstr(line, " b/");
+            if (b) {
+                snprintf(newpath, sizeof newpath, "%s", b + 3);
+                strip_nl(newpath);
+                new_seg = 1;
+            }
+        } else if (strncmp(line, "+++ ", 4) == 0 && cur_path == NULL) {
+            const char *np = line + 4;
+            if (strncmp(np, "b/", 2) == 0) np += 2;
+            else if (strncmp(np, "a/", 2) == 0) np += 2;
+            snprintf(newpath, sizeof newpath, "%s", np);
+            strip_nl(newpath);
+            new_seg = 1;
+        }
+
+        if (new_seg && cur_path) {
+            segs[n - 1].text = cur_text ? cur_text : strdup("");
+            cur_text = NULL;
+            cur_len = 0;
+            cur_path = NULL;
+        }
+        if (new_seg && !cur_path && newpath[0]) {
+            if (n == c) {
+                c = c ? c * 2 : 8;
+                segs = realloc(segs, sizeof(*segs) * c);
+            }
+            segs[n].path = strdup(newpath);
+            segs[n].text = NULL;
+            cur_path = segs[n].path;
+            n++;
+        }
+        if (cur_path) {
+            size_t l = strlen(line);
+            cur_text = realloc(cur_text, cur_len + l + 1);
+            memcpy(cur_text + cur_len, line, l);
+            cur_len += l;
+            cur_text[cur_len] = '\0';
+        }
+    }
+    if (cur_path)
+        segs[n - 1].text = cur_text ? cur_text : strdup("");
+
+    free(line);
+    fclose(f);
+    *out = segs;
+    return n;
+}
+
+/* write a conflict message (real diff-conflict) to stderr + messages/ */
+static void print_diff_conflict(ps_store *ps, const char *relpath,
+                                const char *theirs, const char *proposed) {
+    char mdir[4096];
+    snprintf(mdir, sizeof mdir, "%s/messages/%s", ps->store_dir, ps->owner);
+    ensure_dir(mdir);
+    int64_t seq = next_seq(ps);
+    char msg[4096], tmp[4192];
+    snprintf(msg, sizeof msg, "%s/%lld.msg", mdir, (long long)seq);
+    snprintf(tmp, sizeof tmp, "%s.tmp", msg);
+
+    FILE *out = fopen(tmp, "w");
+    if (!out) return;
+    const char *hdr = "CONFLICT applying patch to %s (real final diff-conflict):\n\n";
+    fprintf(out, hdr, relpath);
+    fprintf(stderr, hdr, relpath);
+    run_diff(theirs, proposed, "theirs", "proposed (with conflicts)", out);
+    run_diff(theirs, proposed, "theirs", "proposed (with conflicts)", stderr);
+    fclose(out);
+    rename(tmp, msg);
+}
+
+/* apply one file's diff segment to its merged state, with conflict markers */
+static int apply_file_diff(ps_store *ps, const char *relpath, const char *seg) {
+    char diffp[4096], inp[4096];
+    snprintf(diffp, sizeof diffp, "%s/tmp/audit.diff", ps->store_dir);
+    snprintf(inp, sizeof inp, "%s/tmp/audit.in", ps->store_dir);
+
+    char cur[4096];
+    int64_t seq;
+    ps_src src = ps_resolve(ps, relpath, cur, sizeof cur, &seq);
+    if (src == PS_SRC_LOWER)
+        lower_path(ps, relpath, cur, sizeof cur);
+
+    int ifd = open(inp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ifd < 0) return -1;
+    if (copy_path_into(cur, ifd) != 0) { close(ifd); return -1; }
+    close(ifd);
+
+    FILE *df = fopen(diffp, "w");
+    if (!df) return -1;
+    fputs(seg, df);
+    fclose(df);
+
+    char cmd[16384];
+    snprintf(cmd, sizeof cmd, "patch --merge -s -p1 '%s' < '%s' 2>/dev/null", inp, diffp);
+    int rc = system(cmd);
+    if (rc != 0 && rc != 1) {
+        snprintf(cmd, sizeof cmd, "patch --merge -s -p0 '%s' < '%s' 2>/dev/null", inp, diffp);
+        rc = system(cmd);
+    }
+    if (rc != 0 && rc != 1) return -1;
+
+    struct stat st;
+    stat(inp, &st);
+    int fd = open(inp, O_RDONLY);
+    if (fd < 0) return -1;
+
+    if (rc == 1) {
+        /* conflicts -> print the real diff-conflict, do not commit */
+        print_diff_conflict(ps, relpath, cur, inp);
+        close(fd);
+        return -2;
+    }
+
+    int r = merge_put_fd(ps, relpath, fd, st.st_size);
+    close(fd);
+    return r;
+}
+
+int ps_apply_gitdiff(ps_store *ps, const char *diff_text) {
+    struct diff_seg *segs = NULL;
+    int n = split_diff(diff_text, &segs);
+    int applied = 0;
+    for (int i = 0; i < n; i++) {
+        char relpath[4096];
+        snprintf(relpath, sizeof relpath, "/%s", segs[i].path);
+        int rc = apply_file_diff(ps, relpath, segs[i].text);
+        if (rc == 0) applied++;
+        else if (rc == -2) fprintf(stderr, "[overlay] patch conflict on %s (see above + messages/)\n", relpath);
+        free(segs[i].path);
+        free(segs[i].text);
+    }
+    free(segs);
+    return applied;
 }
