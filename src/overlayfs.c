@@ -3,7 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fuse.h>
+#include "fuse.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +11,13 @@
 #include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#define HT_PUBDEF static
+#define HT_IMPLEMENTATION 1
+#include "hash.h"
+#pragma GCC diagnostic pop
 
 #include "patchstore.h"
 
@@ -156,13 +163,32 @@ static int ov_getattr(const char *path, struct stat *st, struct fuse_file_info *
     return -errno;
 }
 
+typedef Ht(const char *, int) strset_t;
+
 struct fill_ctx {
     void *buf;
     fuse_fill_dir_t filler;
+    strset_t *seen; /* names already emitted (lower entries) */
 };
+
+/* add `name` to the de-dup set; returns 1 if it was already present */
+static int seen_add(struct fill_ctx *fc, const char *name) {
+    if (!fc->seen) return 0;
+    if (ht_find(fc->seen, name)) return 1;
+    char *copy = strdup(name);
+    if (!copy) return 0;
+    int *v = ht_put(fc->seen, copy);
+    if (!v) {
+        free(copy);
+        return 0;
+    }
+    *v = 1;
+    return 0;
+}
 
 static void list_add_cb(void *ctx, const char *name) {
     struct fill_ctx *fc = ctx;
+    if (seen_add(fc, name)) return; /* already listed from the lower */
     struct stat st;
     memset(&st, 0, sizeof st);
     st.st_mode = S_IFREG | 0644;
@@ -178,13 +204,13 @@ static void list_dir_add_cb(void *ctx, const char *name) {
 }
 
 static int ov_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-                      off_t offset, struct fuse_file_info *fi,
-                      enum fuse_readdir_flags flags) {
+                      off_t offset, struct fuse_file_info *fi, int flags) {
     (void)offset;
     (void)fi;
     (void)flags;
     struct overlay *ov = OVERLAY_DATA;
-    struct fill_ctx fc = { buf, filler };
+    strset_t seen = { .hasheq = str_hasheq };
+    struct fill_ctx fc = { buf, filler, &seen };
 
     char rest[4096];
     switch (classify(path, rest, sizeof rest)) {
@@ -213,6 +239,7 @@ static int ov_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         struct dirent *e;
         while ((e = readdir(d))) {
             if (e->d_name[0] == '.') continue;
+            seen_add(&fc, e->d_name);
             struct stat st;
             memset(&st, 0, sizeof st);
             st.st_ino = e->d_ino;
@@ -222,12 +249,21 @@ static int ov_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         closedir(d);
     }
 
-    /* patched / merged / new files */
+    /* patched / merged / new files (de-duplicated against the lower) */
     ps_list_dir(ov->ps, path, list_add_cb, &fc);
 
     /* expose the virtual namespace at the root */
     if (strcmp(path, "/") == 0)
         list_dir_add_cb(&fc, "fuse");
+
+    /* free the de-dup set (keys are strdup'd) */
+    {
+        ht_foreach(it, &seen) {
+            const char *k = ht_key(&seen, it);
+            free((char *)k);
+        }
+        ht_free(&seen);
+    }
 
     return 0;
 }
@@ -316,7 +352,6 @@ static int ov_open(const char *path, struct fuse_file_info *fi) {
             }
         }
         fi->fh = (uint64_t)(uintptr_t)h;
-        fi->direct_io = 1;
         return 0;
     }
 
@@ -386,7 +421,6 @@ static int ov_open(const char *path, struct fuse_file_info *fi) {
     }
 
     fi->fh = (uint64_t)(uintptr_t)h;
-    fi->direct_io = 1;
     return 0;
 }
 
@@ -529,7 +563,6 @@ static int ov_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
         h->audit_tmp = strdup(tpl);
         h->audit = 1;
         fi->fh = (uint64_t)(uintptr_t)h;
-        fi->direct_io = 1;
         return 0;
     }
 
@@ -550,7 +583,6 @@ static int ov_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     }
     h->fd = ps_session_fd(h->sess);
     fi->fh = (uint64_t)(uintptr_t)h;
-    fi->direct_io = 1;
     return 0;
 }
 

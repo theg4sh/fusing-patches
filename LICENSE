@@ -27,6 +27,10 @@ Third-party code vendored in this repository:
 - src/ht.h — Hash Table in C by Alexey Kutepov (tsoding), dual-licensed
   MIT / Public Domain (Unlicense). See the license block at the end of the file.
 - The murmur3 32-bit hash constants/algorithm used for path keys (public domain,
-  Austin Appleby) are reimplemented in src/patchstore.c.
+  Austin Appleby) are reimplemented in src/hash.h.
+- The FUSE layer (src/fuse.c) implements the kernel FUSE protocol directly;
+  it includes the kernel UAPI header linux/fuse.h, which is licensed
+  ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause) — this project uses it
+  under BSD-2-Clause. No LGPL/GPL code is used or linked; libfuse is not used.
 - The in-process diff/merge engine (src/diff.c) is original code by this
-  project; no LGPL/GPL code is used or linked.
+  project.

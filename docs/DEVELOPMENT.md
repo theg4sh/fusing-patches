@@ -27,7 +27,8 @@ Dynamic (development) build:
 make                  # -> build/fusing-patches (+ build/stress, build/difftest)
 ```
 
-Requirements: C compiler, `pkg-config`, libfuse3 development headers.
+Requirements: a C compiler. Nothing else — the FUSE layer is implemented
+in-process against the kernel protocol (`linux/fuse.h`).
 
 Static build (no runtime dynamic dependencies):
 
@@ -35,29 +36,30 @@ Static build (no runtime dynamic dependencies):
 make static           # -> build/fusing-patches-static
 ```
 
-Requirements: network access (downloads the libfuse3 source tarball once into
-`build/fuse-<ver>/`) and `meson`/`ninja` (builds libfuse3 as a static archive).
-The static binary is glibc-static; it has no runtime dependencies besides the
-kernel and the `fusermount3` setuid helper needed to mount.
+Same requirement (a C compiler); it is a plain `-static` link. The static
+binary is glibc-static; its only runtime dependencies are the kernel and the
+`fusermount3` setuid helper needed to mount.
 
-Cleaning: `make clean` removes `build/` (including the downloaded libfuse;
-`make static` re-fetches it).
+Cleaning: `make clean` removes `build/`.
 
 ## Module map
 
 | File               | Responsibility                                                                                                                                                                                                                                            |
 |------              |----------------                                                                                                                                                                                                                                           |
-| `src/overlayfs.c`  | All FUSE callbacks. Write commits happen in `flush` (synchronous with `close()`); `release` is the fallback. Owns the `/fuse/` virtual namespace and mount-kind routing.                                                                                  |
+| `src/fuse.c`       | Own FUSE layer: kernel protocol loop over `/dev/fuse` (single-threaded), mount/unmount via the `fusermount3` helper, inode table, reply framing. No libfuse.                                                                                              |
+| `src/overlayfs.c`  | FUSE callbacks (business logic). Write commits happen in `flush` (synchronous with `close()`); `release` is the fallback. Owns the `/fuse/` virtual namespace and mount-kind routing.                                                                      |
 | `src/patchstore.c` | Everything durable: global seq (flock), patch index (`meta/`), byte ranges (`ranges/`), merged snapshots (`merge/`), per-mountpoint state (`mounts/`), messages (`messages/`), origin snapshots (`origin/`), apply-to-origin, git-diff splitting + audit. |
 | `src/diff.c`       | `diff_unified` (Myers), `merge3` (git-style 3-way), `apply_unified_diff` (hunk applier with offset search + conflict markers). No external tools.                                                                                                         |
-| `src/ht.h`         | Hash table used for session indexing and path dedup (murmur3-hashed string keys).                                                                                                                                                                         |
+| `src/ht.h`         | Hash table used for session indexing, inode table and path dedup (murmur3-hashed string keys).                                                                                                                                                            |
+| `src/hash.h`       | murmur3 32-bit + C-string hasheq, shared by the modules.                                                                                                                                                                                                 |
 
 ## Code conventions
 
 These are enforced by review, not tooling:
 
-- No `system()`, `popen()`, or shell construction anywhere; no `fork()` (the
-  daemon is single-process). All formatting via bounded `snprintf`.
+- No `system()`, `popen()`, or shell construction anywhere. `fork()` is used
+  only to run the `fusermount3` mount helper at mount/unmount time. All
+  formatting via bounded `snprintf`.
 - `x = realloc(x, …)` is forbidden: use a temp pointer and handle failure.
   On OOM prefer graceful degradation (partial parse, skipped entry) over abort.
 - All mutations of `ps->sessions` / `sessions_ht` under `ps->lock`; process-local
@@ -85,14 +87,16 @@ These are enforced by review, not tooling:
   cp <pristine-ht.h> /tmp/ht.h && (cd /tmp && patch -s -p0 < patches/ht.h.patch)
   ```
 
-- murmur3 32-bit (public domain) is reimplemented in `src/patchstore.c`
+- murmur3 32-bit (public domain) is reimplemented in `src/hash.h`
   (`murmur3_32`, byte-wise, alignment-safe).
+- The kernel UAPI header `linux/fuse.h` is used under its BSD-2-Clause option.
 
 No LGPL/GPL code is used or linked — the project is MIT-licensed (`LICENSE`).
 
 ## Debugging
 
-- Run the daemon with `-d` (libfuse request trace) and `-f` (foreground).
+- Run the daemon in the foreground (`-f`); add debug prints in `src/fuse.c`'s
+  dispatcher for protocol-level tracing.
 - Conflict messages go to the daemon's stderr and to `/fuse/messages/` in the
   mount — see `USAGE.md`.
 - The store directory is fully inspectable while mounts are live

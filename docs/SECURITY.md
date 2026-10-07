@@ -22,9 +22,10 @@ concurrent daemons on one store, and unprivileged store readers.
 
 ## 2. Implementation guarantees
 
-- **No shell, no fork, no external tools.** All diff/merge/patch work is
-  in-process (`src/diff.c`); there is no `system()`/`popen()` and the daemon
-  never forks. The static binary has no runtime dependencies beyond the kernel.
+- **No shell, no external tools.** All diff/merge/patch work is in-process
+  (`src/diff.c`); there is no `system()`/`popen()`. The daemon forks only to
+  run the `fusermount3` mount helper at mount/unmount time. The static binary
+  has no runtime dependencies beyond the kernel.
 - **No command injection surface.** No user-derived string ever reaches a
   shell or `exec`; all formatting uses bounded `snprintf`.
 - **Private store.** The daemon sets `umask(0077)`; store directories are
@@ -78,8 +79,8 @@ concurrent daemons on one store, and unprivileged store readers.
 
 ## 5. Secure-development rules
 
-- No `system()`, `popen()`, shell construction, or `fork()`. External
-  programs are not used.
+- No `system()`, `popen()`, or shell construction. `fork()` is used only for
+  the `fusermount3` mount helper. External programs are not used.
 - Bounded `snprintf` only; never `sprintf`/`strcpy`/`strcat`.
 - `x = realloc(x, …)` is forbidden: temp pointer + checked, graceful failure.
 - All mutations of `ps->sessions`/`sessions_ht` under `ps->lock`; process-local

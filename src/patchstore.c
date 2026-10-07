@@ -2,6 +2,8 @@
 
 #define _GNU_SOURCE 1
 #include "diff.h"
+#define HT_PUBDEF static
+#include "hash.h"
 #include <stdlib.h>
 
 #pragma GCC diagnostic push
@@ -80,7 +82,6 @@ typedef Ht(const char *, int) strset_t;
 /* worst-case percent-encoding expansion of a FUSE path: 3x + NUL */
 #define ENC_MAX (3 * PATH_MAX + 1)
 
-static uintptr_t path_hasheq(Ht_Op op, void const *a, void const *b, size_t n);
 
 /* ------------------------------------------------------------------ */
 /* small helpers                                                       */
@@ -439,7 +440,7 @@ ps_store *ps_open(const char *store_dir, const char *lower_dir) {
     ps->store_dir = strdup(store_dir);
     ps->lower_dir = strdup(lower_dir);
     pthread_mutex_init(&ps->lock, NULL);
-    ps->sessions_ht.hasheq = path_hasheq;
+    ps->sessions_ht.hasheq = str_hasheq;
 
     const char *subs[] = { "blobs", "meta", "merge", "mounts", "messages", "origin", "ranges", "tmp" };
     if (ensure_dir(ps->store_dir) != 0) goto fail;
@@ -881,56 +882,6 @@ void ps_report_conflict(ps_store *ps, ps_session *s) {
 
     rl_free(&reported);
     rl_free(&cr);
-}
-
-/* ------------------------------------------------------------------ */
-/* murmur3 32-bit (public domain, Austin Appleby) — byte-wise, alignment-safe */
-static uint32_t murmur3_32(const uint8_t *key, size_t len, uint32_t seed) {
-    uint32_t h = seed;
-    const uint32_t c1 = 0xcc9e2d51, c2 = 0x1b873593;
-    size_t i = 0;
-    for (; i + 4 <= len; i += 4) {
-        uint32_t k = (uint32_t)key[i] | ((uint32_t)key[i + 1] << 8) |
-                     ((uint32_t)key[i + 2] << 16) | ((uint32_t)key[i + 3] << 24);
-        k *= c1;
-        k = (k << 15) | (k >> 17);
-        k *= c2;
-        h ^= k;
-        h = (h << 13) | (h >> 19);
-        h = h * 5 + 0xe6546b64;
-    }
-    uint32_t k = 0;
-    switch (len & 3) {
-    case 3: k ^= (uint32_t)key[i + 2] << 16; /* fallthrough */
-    case 2: k ^= (uint32_t)key[i + 1] << 8;  /* fallthrough */
-    case 1: k ^= (uint32_t)key[i];
-        k *= c1;
-        k = (k << 15) | (k >> 17);
-        k *= c2;
-        h ^= k;
-    }
-    h ^= (uint32_t)len;
-    h ^= h >> 16;
-    h *= 0x85ebca6b;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35;
-    h ^= h >> 16;
-    return h;
-}
-
-/* hasheq for C-string path keys, hashed with murmur3 */
-static uintptr_t path_hasheq(Ht_Op op, void const *a_, void const *b_, size_t n) {
-    (void)n;
-    char const *const *a = (char const *const *)a_;
-    switch (op) {
-    case HT_HASH:
-        return (uintptr_t)murmur3_32((const uint8_t *)*a, strlen(*a), 0x51ed2701);
-    case HT_EQ: {
-        char const *const *b = (char const *const *)b_;
-        return strcmp(*a, *b) == 0;
-    }
-    }
-    return 0;
 }
 
 /* commit                                                              */
@@ -1464,7 +1415,7 @@ static int emit_origin_conflict(ps_store *ps, const char *relpath) {
 int ps_report_origin_conflicts(ps_store *ps) {
     char **paths = NULL;
     int n = 0, cap = 0;
-    strset_t seen = { .hasheq = path_hasheq };
+    strset_t seen = { .hasheq = str_hasheq };
 
     char mdir[4096];
     snprintf(mdir, sizeof mdir, "%s/meta", ps->store_dir);
@@ -1531,7 +1482,7 @@ static void collect_path(strset_t *seen, char ***arr, int *n, int *cap, const ch
 int ps_apply_to_origin(ps_store *ps) {
     char **paths = NULL;
     int n = 0, cap = 0;
-    strset_t seen = { .hasheq = path_hasheq };
+    strset_t seen = { .hasheq = str_hasheq };
 
     /* collect modified paths from patch index + merge index */
     char mdir[4096];

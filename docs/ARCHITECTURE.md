@@ -152,8 +152,9 @@ The auditor mounts `--patch-view` and can, before the final unmount:
 
 ## 9. Static build
 
-`make static` downloads and builds libfuse3 as a static archive, then links a
-fully static binary with no runtime dynamic dependencies:
+`make static` links a fully static binary (a plain `-static` link — the FUSE
+layer is our own, so no libraries are needed) with no runtime dynamic
+dependencies:
 
 ```
 make static   # -> build/fusing-patches-static
@@ -189,8 +190,10 @@ $ ldd build/fusing-patches-static
   O(ND)), a git-style 3-way merge with conflict markers (`merge3`), and the
   unified-diff **applier** (`apply_unified_diff`: hunk parsing, context
   matching with a forward/backward offset search, conflict markers on
-  unmatched hunks). **No external tools, no fork** — the daemon is fully
-  self-contained. Diff inputs beyond 2048 total lines fall back to a coarse
+  unmatched hunks). **No external tools; forks only for the fusermount3
+  mount helper** — the daemon is otherwise self-contained, with its own FUSE
+  protocol layer (`src/fuse.c`, over `/dev/fuse`). Diff inputs beyond 2048
+  total lines fall back to a coarse
   replace-all edit script; audit diffs are capped at 16 MiB and diff bases at
   64 MiB.
 - Fast lookups use a vendored hash table (`src/ht.h`, MIT/Public Domain, with

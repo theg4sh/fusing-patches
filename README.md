@@ -91,9 +91,9 @@ make          # dynamic build  -> build/fusing-patches
 make static   # static build   -> build/fusing-patches-static (no runtime deps)
 ```
 
-Dynamic build needs libfuse3 development headers; the static build downloads
-and builds libfuse3 itself (network + meson/ninja). Mounting requires the
-`fusermount3` setuid helper.
+Both builds need only a C compiler — the FUSE layer is implemented in-process
+against the kernel protocol (`linux/fuse.h`), no external libraries. Mounting
+uses the system's `fusermount3` setuid helper (kernel mount privilege).
 
 ## Documentation
 
